@@ -23,21 +23,25 @@ The point is not to steal. The point is to prove the absurdity of the model.
 
 ---
 
-## The Martyr Disclaimer
+## Disclaimer
 
-**READ THIS BEFORE RUNNING ANYTHING.**
+**I do not endorse running this tool. I am not suggesting you should.**
+
+This project was an AI-generated experiment. I had an idea, I described it, and an AI wrote the code. I have not audited the code in detail, I am not vouching for its safety, and I am not claiming it works correctly. I thought the concept of such a tool *should exist* as a piece of open-source commentary, so I let it be written. That is the extent of my involvement.
+
+**On my own testing:** I intend to test this only in a VM, against a throwaway Steam account, with CS2 launched in `-insecure` mode. That is the only responsible way to approach unreviewed code that injects into a live process.
+
+**On the VAC risk:**
 
 | Situation | Consequence |
 |---|---|
-| CS2 launched with `-insecure` + SAS injected | Safe. VAC is not active. No ban. |
-| CS2 launched **without** `-insecure` + SAS injected | **Permanent VAC ban. No appeal. No exceptions.** |
+| CS2 launched with `-insecure` + SAS injected | VAC is not active. No ban expected. |
+| CS2 launched **without** `-insecure` + SAS injected | **Permanent VAC ban. No appeal.** |
 | Joining *any* VAC-protected server with SAS loaded | **Permanent VAC ban.** |
 
-The developer of this tool (Gamah) runs this on their own account and is comfortable with the consequences. The tool exists to make a point. If Valve bans the account, that ban itself becomes part of the commentary: *a company so protective of digital scarcity that it punishes users for looking at textures.*
+Do not run this on an account you care about. Do not run this if you don't understand what DLL injection means. Do not trust AI-written code that touches a live game process without reading it yourself first.
 
-**Do not run this on an account you care about unless you share this philosophy.**
-
-This is not a cheat. There is no aim assistance, no wallhack, no competitive advantage. It is a texture viewer. The VAC ban risk is real and accepted, not hidden.
+This is not a cheat — there is no aim assistance, no wallhack, no competitive advantage. It is a client-side texture viewer. But it is also code I did not write by hand, so treat it accordingly.
 
 ---
 

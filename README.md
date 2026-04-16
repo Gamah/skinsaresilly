@@ -1,6 +1,18 @@
 # SkinsAreSilly (SAS)
 
-> *"A skin is just paint on a wall. The gallery should be free to enter."*
+> THIS PART IS THE ONLY THING THAT IS NOT AI GENERATED ABOUT THIS PROJECT:
+> 
+> This will get you VAC banned but it is not a cheat.
+> 
+> All it does is set the skin to whatever you want.
+> 
+> If faceit releasted an update to their anticheat that adds cheats I'm guessing it wouldn't result in all of their users being VAC banned.
+> 
+> Valve would likely reverse any VAC bans if that did happen, they have done similar things before.
+> 
+> You can see the code, valve can see the code, nobody can say this can be used to cheat, it will never be updated to attempt to cheat.
+> 
+> Do with this information what you must.
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Platform: Windows](https://img.shields.io/badge/Platform-Windows-lightgrey)](https://github.com)

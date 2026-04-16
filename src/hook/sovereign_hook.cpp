@@ -1,4 +1,5 @@
 #include "sovereign_hook.h"
+#include "shared_skin_state.h"
 
 #include <windows.h>
 #include <psapi.h>
@@ -76,53 +77,46 @@ static uintptr_t EntityFromHandle(uintptr_t entityListBase, uint32_t handle)
 // ---------------------------------------------------------------------------
 namespace {
 
-std::atomic<int>  g_activeSkinDefIndex{0}; // CS2 item definition index for desired skin
 std::atomic<bool> g_running{false};
 std::thread       g_updateThread;
 
 // ---------------------------------------------------------------------------
-// ApplySkins — walks the local player's weapon loadout and overwrites the
-// item definition index on each weapon's C_EconItemView.
+// ApplySkins — reads the current skin selection from shared memory (written by
+// MuseumCurator.exe), then walks the local player's weapon loadout and writes:
 //
-// Called periodically from a background thread so the skin persists across
-// weapon switches and round restarts.
+//   C_EconItemView::m_iItemDefinitionIndex  — weapon type (AK-47 = 7, AWP = 9…)
+//   C_EconEntity::m_nFallbackPaintKit       — paint kit ID (Dragon Lore = 344…)
+//   C_EconEntity::m_flFallbackWear          — wear float [0.0, 1.0]
 //
-// Navigation chain (all offsets from cs2-dumper client_dll.hpp):
+// The fallback fields exist precisely for this use-case and are the simplest
+// reliable path; no attribute array traversal required.
 //
-//   client.dll base
-//     + offsets::dwLocalPlayerController
-//     → CCSPlayerController*
-//         + schemas::CCSPlayerController_InventoryServices (InventoryServices ptr)
-//         → CCSPlayerController_InventoryServices*
-//             + schemas::CCSPlayerController_InventoryServices::m_vecNetworkableLoadout
-//             → CHandle<C_EconItemView>[64]   (one per loadout slot)
-//
-// For each non-null loadout entry:
-//   resolve handle → CEntityInstance (the weapon entity)
-//     + schemas::C_EconEntity::m_AttributeManager
-//     → CAttributeContainer*
-//         + schemas::C_AttributeContainer::m_Item
-//         → C_EconItemView*
-//             + schemas::C_EconItemView::m_iItemDefinitionIndex  ← write here
-//
-// TODO — Paint kit (skin texture):
-//   m_iItemDefinitionIndex selects the weapon TYPE (AK-47, AWP, etc.).
-//   The paint kit (which skin pattern/finish) is stored as an attribute in the
-//   item's CEconItemAttribute array. Attribute definition index 6 is "set supply
-//   crate series" — the exact attr def index for paint kits needs to be confirmed
-//   against the current CS2 item schema (items_game.txt). Once known, add:
-//
-//     uintptr_t attrBase = itemViewPtr + schemas::C_EconItemView::m_AttributeList;
-//     // iterate CEconItemAttribute array, find attr def == PAINTKIT_ATTR_DEF,
-//     // write desired paint kit ID to m_value_bytes (uint32 cast from float)
-//
-//   Reference: https://github.com/a2x/cs2-dumper output/client_dll.hpp
-//              search for C_EconItemAttribute, CEconItemAttributeDefinition
+// Navigation chain (offsets from cs2-dumper client_dll.hpp):
+//   client.dll base + dwLocalPlayerController → CCSPlayerController*
+//     → m_pInGameMoneyServices → CCSPlayerController_InventoryServices*
+//       → m_vecNetworkableLoadout[64] → entity handles
+//         → weapon entity
+//           → m_AttributeManager → C_AttributeContainer → m_Item → C_EconItemView
 // ---------------------------------------------------------------------------
 static void ApplySkins()
 {
-    int desiredDefIndex = g_activeSkinDefIndex.load();
-    if (desiredDefIndex == 0) return;
+    // Read skin selection from shared memory written by MuseumCurator.exe.
+    HANDLE hMap = OpenFileMappingW(FILE_MAP_READ, FALSE, SKINSARESILLY_SHMEM_NAME);
+    if (!hMap) return; // UI not running
+
+    const auto* state = static_cast<const SharedSkinState*>(
+        MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, sizeof(SharedSkinState)));
+    if (!state || state->weaponDefIndex == 0) {
+        if (state) UnmapViewOfFile(state);
+        CloseHandle(hMap);
+        return;
+    }
+
+    int   desiredDefIndex = state->weaponDefIndex;
+    int   paintKitId      = state->paintKitId;
+    float wear            = state->wear;
+    UnmapViewOfFile(state);
+    CloseHandle(hMap);
 
     // Resolve client.dll base — we are already inside the process
     uintptr_t clientBase = reinterpret_cast<uintptr_t>(GetModuleHandleA("client.dll"));
@@ -166,12 +160,14 @@ static void ApplySkins()
         // m_Item is likewise an embedded C_EconItemView inside C_AttributeContainer.
         uintptr_t itemViewPtr = attrMgrBase + schemas::C_AttributeContainer::m_Item;
 
-        // Write the desired item definition index
-        // This changes the weapon's base type — for skins, also write the
-        // paint kit attribute (see TODO above).
+        // Write weapon type.
         MemWrite<uint16_t>(
             itemViewPtr + schemas::C_EconItemView::m_iItemDefinitionIndex,
             static_cast<uint16_t>(desiredDefIndex));
+
+        // Write paint kit and wear directly to the fallback fields on C_EconEntity.
+        MemWrite<int32_t>(weaponEntity + schemas::C_EconEntity::m_nFallbackPaintKit, paintKitId);
+        MemWrite<float>  (weaponEntity + schemas::C_EconEntity::m_flFallbackWear,    wear);
     }
 }
 
@@ -201,11 +197,6 @@ void Uninstall()
     g_running.store(false);
     if (g_updateThread.joinable())
         g_updateThread.join();
-}
-
-void SetActiveSkin(int itemDefIndex)
-{
-    g_activeSkinDefIndex.store(itemDefIndex);
 }
 
 } // namespace SovereignHook

@@ -28,9 +28,30 @@ The point is not to steal. The point is to prove the absurdity of the model.
 
 Because the moment this project is closed-source, it becomes untrustworthy.
 
-You should be able to read every line of code that touches your game process. If you cannot read C++, find someone who can. The source is here. Build it yourself. Do not run binaries from strangers.
+You should be able to read every line of code that touches your game process. If you cannot read C++, find someone who can. The source is here.
 
 See [`docs/security.md`](docs/security.md) for a plain-English explanation of every Windows API this tool calls.
+
+---
+
+## Pre-built Binaries
+
+A compiled `bin/` directory is included in this repository for convenience. **Using it means trusting this commit.**
+
+Before running anything, verify the hashes match the source you can read:
+
+| File | SHA-256 |
+|------|---------|
+| `bin/SovereignHook.dll` | `c36810396eba17d09b9df91da85dead0badf6eac416a83172a9e33a9745838de` |
+| `bin/MuseumCurator.exe` | `49166c6d5c59c6649f9e6575588710b880ca4f00bba6a0558c82c6fb0ec0c080` |
+
+```powershell
+# PowerShell — verify before running
+Get-FileHash bin\SovereignHook.dll  -Algorithm SHA256
+Get-FileHash bin\MuseumCurator.exe  -Algorithm SHA256
+```
+
+If the hashes do not match exactly, **do not run the files.** Build from source instead (see below).
 
 ---
 

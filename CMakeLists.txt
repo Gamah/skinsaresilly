@@ -81,6 +81,7 @@ add_library(SovereignHook SHARED
     src/hook/sovereign_hook.cpp
 )
 target_include_directories(SovereignHook PRIVATE
+    src
     src/hook
     ${CS2_DUMPER_INCLUDE_DIR}   # client_dll.hpp, offsets.hpp, interfaces.hpp
     ${HL2SDK_INCLUDE_DIRS}      # IEntitySystem, CEntityHandle, etc.

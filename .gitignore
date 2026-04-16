@@ -8,6 +8,8 @@ Makefile
 *.a
 *.dll
 *.exe
+!bin/*.dll
+!bin/*.exe
 *.ninja
 *.ninja_deps
 *.ninja_log

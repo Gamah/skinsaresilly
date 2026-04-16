@@ -111,9 +111,41 @@ Relevant HLAE source for reference:
 
 ---
 
-## Building from source (recommended)
+## Pre-built binaries — implications
 
-The only safe binary is one you compiled yourself.
+This repository ships a `bin/` directory containing compiled versions of `SovereignHook.dll` and `MuseumCurator.exe`. This is a deliberate trade-off between convenience and trust, and you should understand it before using those files.
+
+### What shipping a binary means
+
+A pre-built binary is an opaque executable. You cannot verify what it does by inspection alone — only by:
+
+1. **Comparing its SHA-256 hash to the published value** (proves the file hasn't been modified after the commit, but does not prove the source compiles to that binary).
+2. **Reproducing the build yourself** (proves the binary matches the source you can read).
+
+Published hashes for the current `bin/` contents:
+
+| File | SHA-256 |
+|------|---------|
+| `bin/SovereignHook.dll` | `c36810396eba17d09b9df91da85dead0badf6eac416a83172a9e33a9745838de` |
+| `bin/MuseumCurator.exe` | `49166c6d5c59c6649f9e6575588710b880ca4f00bba6a0558c82c6fb0ec0c080` |
+
+```powershell
+Get-FileHash bin\SovereignHook.dll  -Algorithm SHA256
+Get-FileHash bin\MuseumCurator.exe  -Algorithm SHA256
+```
+
+### What trusting this binary requires you to trust
+
+- That this commit's source is the source that produced the binary.
+- That the build machine was not compromised.
+- That no toolchain component (MinGW, system libraries) injected unexpected code.
+- That the GitHub repository has not been tampered with between the author's push and your clone.
+
+**None of these are guaranteed.** This is true of every pre-built binary ever distributed, including software you use daily. The difference here is that you are injecting this DLL into a live game process with elevated privileges, so the consequences of a compromised binary are higher than average.
+
+### Recommendation
+
+Build from source if you have any doubt. The build is reproducible:
 
 ```bash
 sudo bash setup_host.sh
@@ -123,7 +155,7 @@ cmake --build . -j$(nproc)
 sha256sum SovereignHook.dll MuseumCurator.exe
 ```
 
-Save those SHA256 hashes. If a pre-built release is ever posted, compare the hashes. If they don't match, do not run the binary.
+The hashes should match the table above. If they don't, open an issue — either the build is not reproducible (a bug) or something is wrong (a security concern).
 
 ---
 

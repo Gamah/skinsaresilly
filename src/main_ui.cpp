@@ -15,27 +15,17 @@
 #include "imgui.h"
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
+#include "skin_catalogue.h"
+#include "shared_skin_state.h"
 
 // Forward declare message handler from imgui_impl_win32.cpp
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
 // ---------------------------------------------------------------------------
-// Skin catalogue — placeholder names; real impl would pull from CS2 item schema
+// Shared memory — IPC to SovereignHook.dll running inside cs2.exe
 // ---------------------------------------------------------------------------
-struct SkinEntry { const char* name; int defIndex; };
-static const SkinEntry k_skins[] = {
-    { "-- None (Default) --", 0    },
-    { "AK-47 | Dragon Lore",  1234 },
-    { "AK-47 | Redline",      1235 },
-    { "AWP | Fade",           1236 },
-    { "AWP | Asiimov",        1237 },
-    { "M4A4 | Howl",          1238 },
-    { "USP-S | Kill Confirmed",1239 },
-    { "Glock-18 | Fade",      1240 },
-    { "Desert Eagle | Blaze", 1241 },
-    { "Karambit | Doppler",   1242 },
-};
-static const int k_skinCount = static_cast<int>(sizeof(k_skins) / sizeof(k_skins[0]));
+static HANDLE           g_hSkinShmem  = nullptr;
+static SharedSkinState* g_pSkinState  = nullptr;
 
 // ---------------------------------------------------------------------------
 // D3D11 / Win32 globals
@@ -93,6 +83,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
 
     ShowWindow(g_hwnd, SW_SHOWDEFAULT);
     UpdateWindow(g_hwnd);
+
+    // Create the shared memory region that SovereignHook.dll will read.
+    g_hSkinShmem = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr,
+        PAGE_READWRITE, 0, sizeof(SharedSkinState), SKINSARESILLY_SHMEM_NAME);
+    if (g_hSkinShmem)
+        g_pSkinState = static_cast<SharedSkinState*>(
+            MapViewOfFile(g_hSkinShmem, FILE_MAP_WRITE, 0, 0, sizeof(SharedSkinState)));
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -199,8 +196,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
             if (ImGui::BeginCombo("##skinlist", k_skins[g_selectedSkin].name)) {
                 for (int i = 0; i < k_skinCount; ++i) {
                     bool selected = (g_selectedSkin == i);
-                    if (ImGui::Selectable(k_skins[i].name, selected))
+                    if (ImGui::Selectable(k_skins[i].name, selected)) {
                         g_selectedSkin = i;
+                        if (g_pSkinState) {
+                            g_pSkinState->weaponDefIndex = k_skins[i].weaponDefIndex;
+                            g_pSkinState->paintKitId     = k_skins[i].paintKitId;
+                            g_pSkinState->wear           = k_skins[i].wear;
+                        }
+                    }
                     if (selected)
                         ImGui::SetItemDefaultFocus();
                 }
@@ -269,6 +272,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
     CleanupDeviceD3D();
+
+    if (g_pSkinState) { UnmapViewOfFile(g_pSkinState); g_pSkinState = nullptr; }
+    if (g_hSkinShmem) { CloseHandle(g_hSkinShmem);     g_hSkinShmem = nullptr; }
+
     DestroyWindow(g_hwnd);
     UnregisterClassW(wc.lpszClassName, hInstance);
     return 0;

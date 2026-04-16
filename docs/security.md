@@ -69,7 +69,13 @@ The hooked function intercepts the call CS2 makes when determining which skin to
 
 ## Third-party dependencies (fetched at build time)
 
-SovereignHook.dll is built against two open-source libraries fetched from GitHub via CMake FetchContent. Nothing is bundled as a binary — you can audit both before building.
+Both targets are built against open-source libraries fetched from GitHub via CMake FetchContent. Nothing is bundled as a binary — you can audit all of them before building.
+
+### nlohmann/json v3.11.3 (`MuseumCurator.exe` only)
+- **Repo**: https://github.com/nlohmann/json
+- **What it provides**: A header-only C++ JSON parser.
+- **How it's used**: `skin_loader.h` uses it to parse the optional `skins.json` catalogue file at startup. `inspect_api.h` uses it to parse the JSON response from the CSGOFloat API (see the inspect link section below). No executable code from this library touches cs2.exe — it is compiled only into `MuseumCurator.exe`.
+- **How to verify**: The library is a single header (`nlohmann/json.hpp`). No native code, no network calls, no file I/O of its own.
 
 ### a2x/cs2-dumper
 - **Repo**: https://github.com/a2x/cs2-dumper
@@ -82,6 +88,32 @@ SovereignHook.dll is built against two open-source libraries fetched from GitHub
 - **What it provides**: Source 2 engine interface declarations — `IEntitySystem`, `CEntityHandle`, `CBaseEntity`, etc. Used by SourceMod and MetaMod, the legitimate CS2 server plugin ecosystem.
 - **How it's used**: Included for engine type definitions. Headers only — nothing compiled from this repo goes into the output DLL.
 - **How to verify**: Headers only. No compiled code from this dependency is in the final DLL.
+
+---
+
+## Skin catalogue and inspect link (`MuseumCurator.exe`)
+
+### Optional local file read — `skins.json`
+
+On startup, `MuseumCurator.exe` looks for a file named `skins.json` in the same directory as the executable.
+
+**API used:** `_wfopen` (standard C file I/O)
+
+If found, it reads and parses the file to populate the full skin catalogue (sourced from [ByMykel/CSGO-API](https://github.com/ByMykel/CSGO-API)). If the file is absent, a small built-in fallback list is used instead. The file is read once at startup and never written to. No data from the file is sent anywhere.
+
+### Optional outbound HTTPS request — inspect link import
+
+When the user pastes a Steam inspect link into the "Import from Inspect Link" field and clicks Apply, `MuseumCurator.exe` makes a single outbound HTTPS request.
+
+**APIs used:** `WinHttpOpen`, `WinHttpConnect`, `WinHttpOpenRequest`, `WinHttpSendRequest`, `WinHttpReceiveResponse`, `WinHttpReadData`, `WinHttpCloseHandle`
+
+- **Destination**: `https://api.csgofloat.com/` (port 443, TLS)
+- **What is sent**: The inspect URL you pasted, percent-encoded as a query parameter — e.g. `GET /?url=steam%3A%2F%2Frungame%2F730%2F...`
+- **What is received**: A JSON object containing the item's `defindex` (weapon type), `paintindex` (skin), `floatvalue` (wear), and display name. No account data, no Steam credentials, no machine identifiers.
+- **When it happens**: Only when you explicitly click the Apply button. There is no background polling, no telemetry, and no request is made at startup or on skin selection from the catalogue.
+- **Third-party privacy**: The inspect URL you submit is handled by CSGOFloat (csfloat.com). Their privacy policy governs what they log. The inspect URL itself contains your Steam asset ID and a one-time token; it does not contain your Steam password or account credentials.
+
+This feature is entirely optional. If you do not use the inspect link field, no network request is ever made.
 
 ## Comparison to HLAE
 
@@ -103,7 +135,8 @@ Relevant HLAE source for reference:
 ## What this tool does NOT do
 
 - Does not read, exfiltrate, or log any data from your machine
-- Does not contact any network endpoint
+- Does not contact any network endpoint **unless you explicitly use the inspect link import feature** (see above — one HTTPS GET to api.csgofloat.com, only on button click)
+- Does not read any files other than the optional `skins.json` catalogue in its own directory
 - Does not modify any files on disk (no game file patching)
 - Does not affect any process other than cs2.exe
 - Does not provide aim assistance, wallhacks, or any competitive advantage

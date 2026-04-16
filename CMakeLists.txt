@@ -17,6 +17,19 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(imgui)
 
+# ---------------------------------------------------------------------------
+# nlohmann/json — header-only JSON parser (used by skin_loader.h + inspect_api.h)
+# ---------------------------------------------------------------------------
+FetchContent_Declare(
+    nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG        v3.11.3
+    GIT_SHALLOW    TRUE
+)
+set(JSON_BuildTests OFF CACHE INTERNAL "")
+set(JSON_Install    OFF CACHE INTERNAL "")
+FetchContent_MakeAvailable(nlohmann_json)
+
 set(IMGUI_SOURCES
     ${imgui_SOURCE_DIR}/imgui.cpp
     ${imgui_SOURCE_DIR}/imgui_draw.cpp
@@ -110,11 +123,13 @@ add_executable(MuseumCurator WIN32
 target_include_directories(MuseumCurator PRIVATE src)
 target_link_libraries(MuseumCurator PRIVATE
     imgui_win32_dx11
+    nlohmann_json::nlohmann_json
     d3d11
     dxgi
     d3dcompiler_47
     dwmapi
     psapi
+    winhttp
 )
 target_compile_definitions(MuseumCurator PRIVATE
     WIN32_LEAN_AND_MEAN

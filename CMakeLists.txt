@@ -111,6 +111,7 @@ target_link_libraries(MuseumCurator PRIVATE
     imgui_win32_dx11
     d3d11
     dxgi
+    d3dcompiler_47
     dwmapi
     psapi
 )

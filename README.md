@@ -23,6 +23,27 @@ The point is not to steal. The point is to prove the absurdity of the model.
 
 ---
 
+
+## Why Open Source?
+
+Because the moment this project is closed-source, it becomes untrustworthy.
+
+You should be able to read every line of code that touches your game process. If you cannot read C++, find someone who can. The source is here. Build it yourself. Do not run binaries from strangers.
+
+See [`docs/security.md`](docs/security.md) for a plain-English explanation of every Windows API this tool calls.
+
+---
+
+## Support the Commentary
+
+If you find this project interesting — as software, as philosophy, or as provocation — you can buy me a coffee.
+
+**[buymeacoffee.com/Gamah](https://buymeacoffee.com/Gamah)**
+
+---
+
+
+
 ## Disclaimer
 
 **I do not endorse running this tool. I am not suggesting you should.**
@@ -79,24 +100,6 @@ Output files:
 3. Run `MuseumCurator.exe`
 4. Read and acknowledge the disclaimer
 5. Select a skin, click Inject
-
----
-
-## Why Open Source?
-
-Because the moment this project is closed-source, it becomes untrustworthy.
-
-You should be able to read every line of code that touches your game process. If you cannot read C++, find someone who can. The source is here. Build it yourself. Do not run binaries from strangers.
-
-See [`docs/security.md`](docs/security.md) for a plain-English explanation of every Windows API this tool calls.
-
----
-
-## Support the Commentary
-
-If you find this project interesting — as software, as philosophy, or as provocation — you can buy me a coffee.
-
-**[buymeacoffee.com/Gamah](https://buymeacoffee.com/Gamah)**
 
 ---
 

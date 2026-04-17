@@ -105,7 +105,14 @@ std::atomic<uint64_t> g_tickCount{0};
 // Per-entity last-written state used to suppress redundant readback logs.
 // Key = weapon entity address.  We only log when the pre-write value diverges
 // from what we wrote last time (meaning the server/prediction wiped it).
-struct WrittenState { int32_t pk; float wear; uint32_t idHigh; uint64_t itemID; };
+struct WrittenState {
+    int32_t  pk;
+    float    wear;
+    uint32_t idHigh;
+    uint64_t itemID;
+    bool     attribInit;   // m_bAttributesInitialized — true = engine re-processed us
+    bool     visualsSet;   // m_bVisualsDataSet        — true = engine re-processed us
+};
 std::unordered_map<uintptr_t, WrittenState> g_lastWritten;
 uint32_t g_lastLoadoutVersion = 0;
 
@@ -279,26 +286,44 @@ static void ApplySkins()
         // (0x1D0) / m_iItemIDLow (0x1D4).  We must write both: the networked fields so
         // that if the engine re-syncs the cache from High+Low it still sees 0xFFFF…,
         // and the cache field itself so the renderer immediately sees an invalid ID.
-        uint64_t preItemID = MemRead<uint64_t>(itemViewPtr  + schemas::C_EconItemView::m_iItemID);
-        uint32_t preIDHigh = MemRead<uint32_t>(itemViewPtr  + schemas::C_EconItemView::m_iItemIDHigh);
-        int32_t  prePK     = MemRead<int32_t> (weaponEntity + schemas::C_EconEntity::m_nFallbackPaintKit);
-        float    preWear   = MemRead<float>   (weaponEntity + schemas::C_EconEntity::m_flFallbackWear);
+        uint64_t preItemID     = MemRead<uint64_t>(itemViewPtr  + schemas::C_EconItemView::m_iItemID);
+        uint32_t preIDHigh     = MemRead<uint32_t>(itemViewPtr  + schemas::C_EconItemView::m_iItemIDHigh);
+        int32_t  prePK         = MemRead<int32_t> (weaponEntity + schemas::C_EconEntity::m_nFallbackPaintKit);
+        float    preWear       = MemRead<float>   (weaponEntity + schemas::C_EconEntity::m_flFallbackWear);
+        bool     preAttribInit = MemRead<bool>    (weaponEntity + schemas::C_EconEntity::m_bAttributesInitialized);
+        bool     preVisualsSet = MemRead<bool>    (weaponEntity + schemas::C_CSWeaponBase::m_bVisualsDataSet);
 
         auto lastIt = g_lastWritten.find(weaponEntity);
         if (lastIt == g_lastWritten.end()) {
             // First time seeing this entity — log initial state.
             SasLog::Write("tick #%llu: entity=0x%llX defIdx=%d first write; "
-                          "initial ItemID=0x%llX IDHigh=0x%08X pk=%d wear=%.4f",
+                          "initial ItemID=0x%llX IDHigh=0x%08X pk=%d wear=%.4f "
+                          "attribInit=%d visualsSet=%d",
                 tick, (unsigned long long)weaponEntity, defIndex,
-                (unsigned long long)preItemID, preIDHigh, prePK, preWear);
-        } else if (preItemID != lastIt->second.itemID ||
-                   preIDHigh != lastIt->second.idHigh ||
-                   prePK     != lastIt->second.pk     ||
-                   preWear   != lastIt->second.wear) {
-            SasLog::Write("tick #%llu: entity=0x%llX defIdx=%d OVERWRITTEN — "
-                          "ItemID=0x%llX IDHigh=0x%08X pk=%d wear=%.4f",
-                tick, (unsigned long long)weaponEntity, defIndex,
-                (unsigned long long)preItemID, preIDHigh, prePK, preWear);
+                (unsigned long long)preItemID, preIDHigh, prePK, preWear,
+                (int)preAttribInit, (int)preVisualsSet);
+        } else {
+            // Log any field the engine reset since our last write.
+            bool dirty = preItemID     != lastIt->second.itemID    ||
+                         preIDHigh     != lastIt->second.idHigh    ||
+                         prePK         != lastIt->second.pk        ||
+                         preWear       != lastIt->second.wear;
+            // Flag readback: if engine processed attribInit/visualsSet it sets them
+            // BACK to true between our ticks — log those transitions separately.
+            bool attribBack  = lastIt->second.attribInit == false && preAttribInit == true;
+            bool visualsBack = lastIt->second.visualsSet == false && preVisualsSet == true;
+            if (dirty) {
+                SasLog::Write("tick #%llu: entity=0x%llX defIdx=%d OVERWRITTEN — "
+                              "ItemID=0x%llX IDHigh=0x%08X pk=%d wear=%.4f",
+                    tick, (unsigned long long)weaponEntity, defIndex,
+                    (unsigned long long)preItemID, preIDHigh, prePK, preWear);
+            }
+            if (attribBack)
+                SasLog::Write("tick #%llu: entity=0x%llX defIdx=%d attribInit restored to true — engine processed",
+                    tick, (unsigned long long)weaponEntity, defIndex);
+            if (visualsBack)
+                SasLog::Write("tick #%llu: entity=0x%llX defIdx=%d visualsSet restored to true — engine processed",
+                    tick, (unsigned long long)weaponEntity, defIndex);
         }
 
         // Invalidate the non-networked item ID cache (what the renderer actually reads).
@@ -308,13 +333,18 @@ static void ApplySkins()
         MemWrite<int32_t>(weaponEntity + schemas::C_EconEntity::m_nFallbackPaintKit, slot.paintKitId);
         MemWrite<float>  (weaponEntity + schemas::C_EconEntity::m_flFallbackWear,    slot.wear);
 
-        // Clear the "visuals data set" flag on the C_CSWeaponBase so CS2 re-initializes
-        // the weapon's paint material from the item view on the next render frame.
-        // Without this, CS2 caches the material at weapon creation time and never re-reads
-        // m_nFallbackPaintKit even if we correctly invalidate the item ID.
+        // Clear m_bAttributesInitialized so CS2 re-parses the item view attributes.
+        // When this flag is false the attribute manager re-reads the item definition;
+        // with an invalid item ID it should fall through to the fallback paint kit.
+        MemWrite<bool>(weaponEntity + schemas::C_EconEntity::m_bAttributesInitialized, false);
+
+        // Clear m_bVisualsDataSet so the weapon re-applies its paint material.
         MemWrite<bool>(weaponEntity + schemas::C_CSWeaponBase::m_bVisualsDataSet, false);
 
-        g_lastWritten[weaponEntity] = { slot.paintKitId, slot.wear, 0xFFFFFFFFu, 0xFFFFFFFFFFFFFFFFull };
+        g_lastWritten[weaponEntity] = {
+            slot.paintKitId, slot.wear, 0xFFFFFFFFu, 0xFFFFFFFFFFFFFFFFull,
+            /*attribInit=*/false, /*visualsSet=*/false
+        };
         ++written;
     }
 

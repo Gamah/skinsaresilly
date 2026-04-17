@@ -42,7 +42,7 @@ inline int WeaponDefIndexFromId(const std::string& id) {
         {"weapon_usp_silencer",           61},  // USP-S
         {"weapon_cz75a",                  63},
         {"weapon_revolver",               64},
-        {"weapon_knife",                 500},  // Bayonet
+        {"weapon_bayonet",               500},  // Bayonet
         {"weapon_knife_flip",            505},
         {"weapon_knife_gut",             506},
         {"weapon_knife_karambit",        507},

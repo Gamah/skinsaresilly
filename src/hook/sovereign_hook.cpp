@@ -308,6 +308,12 @@ static void ApplySkins()
         MemWrite<int32_t>(weaponEntity + schemas::C_EconEntity::m_nFallbackPaintKit, slot.paintKitId);
         MemWrite<float>  (weaponEntity + schemas::C_EconEntity::m_flFallbackWear,    slot.wear);
 
+        // Clear the "visuals data set" flag on the C_CSWeaponBase so CS2 re-initializes
+        // the weapon's paint material from the item view on the next render frame.
+        // Without this, CS2 caches the material at weapon creation time and never re-reads
+        // m_nFallbackPaintKit even if we correctly invalidate the item ID.
+        MemWrite<bool>(weaponEntity + schemas::C_CSWeaponBase::m_bVisualsDataSet, false);
+
         g_lastWritten[weaponEntity] = { slot.paintKitId, slot.wear, 0xFFFFFFFFu, 0xFFFFFFFFFFFFFFFFull };
         ++written;
     }

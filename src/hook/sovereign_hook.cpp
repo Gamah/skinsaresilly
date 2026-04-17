@@ -102,6 +102,13 @@ std::atomic<bool>     g_running{false};
 std::thread           g_updateThread;
 std::atomic<uint64_t> g_tickCount{0};
 
+// Per-entity last-written state used to suppress redundant readback logs.
+// Key = weapon entity address.  We only log when the pre-write value diverges
+// from what we wrote last time (meaning the server/prediction wiped it).
+struct WrittenState { int32_t pk; float wear; uint32_t idHigh; };
+std::unordered_map<uintptr_t, WrittenState> g_lastWritten;
+uint32_t g_lastLoadoutVersion = 0;
+
 // ---------------------------------------------------------------------------
 // ApplySkins — reads the full per-weapon loadout from shared memory (written by
 // MuseumCurator.exe), then walks the local player's weapon loadout and writes:
@@ -162,8 +169,11 @@ static void ApplySkins()
         return;
     }
 
-    SasLog::Write("tick #%llu: loadout v%u — %zu weapon(s) assigned",
-        tick, loadoutVersion, skinMap.size());
+    if (loadoutVersion != g_lastLoadoutVersion) {
+        SasLog::Write("tick #%llu: loadout v%u — %zu weapon(s) assigned",
+            tick, loadoutVersion, skinMap.size());
+        g_lastLoadoutVersion = loadoutVersion;
+    }
 
     // Resolve client.dll base — we are already inside the process.
     uintptr_t clientBase = reinterpret_cast<uintptr_t>(GetModuleHandleA("client.dll"));
@@ -171,53 +181,48 @@ static void ApplySkins()
         SasLog::Write("tick #%llu: client.dll not found — aborting", tick);
         return;
     }
-    SasLog::Write("tick #%llu: clientBase=0x%llX", tick, (unsigned long long)clientBase);
+    // Verbose pointer chain only on tick 1 — at 64 Hz this would be 60 lines/sec.
+    if (tick == 1)
+        SasLog::Write("tick #%llu: clientBase=0x%llX", tick, (unsigned long long)clientBase);
 
-    // Read the global pointer to the local player controller.
     uintptr_t localControllerPtr = MemRead<uintptr_t>(
         clientBase + offsets::dwLocalPlayerController);
     if (!localControllerPtr) {
-        if (tick % 20 == 1)
+        if (tick % 60 == 1)
             SasLog::Write("tick #%llu: localControllerPtr is null — not in-game yet?", tick);
         return;
     }
-    SasLog::Write("tick #%llu: localControllerPtr=0x%llX", tick, (unsigned long long)localControllerPtr);
 
-    // Read entity list base.
     uintptr_t entityListBase = MemRead<uintptr_t>(
         clientBase + offsets::dwEntityList);
     if (!entityListBase) {
-        SasLog::Write("tick #%llu: entityListBase is null — aborting", tick);
+        if (tick % 60 == 1)
+            SasLog::Write("tick #%llu: entityListBase is null — aborting", tick);
         return;
     }
-    SasLog::Write("tick #%llu: entityListBase=0x%llX", tick, (unsigned long long)entityListBase);
 
-    // Resolve the local player pawn from the controller.
-    // m_hPlayerPawn is a CHandle (uint32) — must be resolved via EntityFromHandle.
     uint32_t pawnHandle = MemRead<uint32_t>(
         localControllerPtr + schemas::CCSPlayerController::m_hPlayerPawn);
     if (pawnHandle == 0xFFFFFFFF || pawnHandle == 0) {
-        if (tick % 20 == 1)
-            SasLog::Write("tick #%llu: pawn handle invalid (0x%08X) — not spawned yet", tick, pawnHandle);
+        if (tick % 60 == 1)
+            SasLog::Write("tick #%llu: pawn handle invalid — not spawned yet", tick);
         return;
     }
-    SasLog::Write("tick #%llu: pawnHandle=0x%08X", tick, pawnHandle);
 
     uintptr_t pawnEntity = EntityFromHandle(entityListBase, pawnHandle);
     if (!pawnEntity) {
-        SasLog::Write("tick #%llu: pawn handle 0x%08X resolved to null entity — stale list?", tick, pawnHandle);
+        if (tick % 60 == 1)
+            SasLog::Write("tick #%llu: pawn handle 0x%08X resolved to null — stale list?", tick, pawnHandle);
         return;
     }
-    SasLog::Write("tick #%llu: pawnEntity=0x%llX", tick, (unsigned long long)pawnEntity);
 
-    // Get weapon services from the pawn (team-agnostic; contains all carried weapons).
     uintptr_t weaponServicesPtr = MemRead<uintptr_t>(
         pawnEntity + schemas::C_BasePlayerPawn::m_pWeaponServices);
     if (!weaponServicesPtr) {
-        SasLog::Write("tick #%llu: weaponServicesPtr is null", tick);
+        if (tick % 60 == 1)
+            SasLog::Write("tick #%llu: weaponServicesPtr is null", tick);
         return;
     }
-    SasLog::Write("tick #%llu: weaponServicesPtr=0x%llX", tick, (unsigned long long)weaponServicesPtr);
 
     // CUtlVector layout (hl2sdk tier1/utlvector.h):
     //   +0x00  int32   m_Size          — element count  (NOT the data pointer)
@@ -231,11 +236,10 @@ static void ApplySkins()
     uintptr_t weaponsDataPtr = MemRead<uintptr_t>(weaponsBase + 0x08);
 
     if (!weaponsDataPtr || weaponsCount <= 0 || weaponsCount > 64) {
-        if (tick % 20 == 1)
+        if (tick % 60 == 1)
             SasLog::Write("tick #%llu: weapon list empty or invalid (count=%d)", tick, weaponsCount);
         return;
     }
-    SasLog::Write("tick #%llu: weaponsDataPtr=0x%llX count=%d", tick, (unsigned long long)weaponsDataPtr, weaponsCount);
 
     int written = 0;
     for (int i = 0; i < weaponsCount; ++i) {
@@ -243,66 +247,73 @@ static void ApplySkins()
         if (handle == 0 || handle == 0xFFFFFFFF) continue;
 
         uintptr_t weaponEntity = EntityFromHandle(entityListBase, handle);
-        SasLog::Write("tick #%llu: slot[%d] handle=0x%08X entity=0x%llX",
-            tick, i, handle, (unsigned long long)weaponEntity);
         if (!weaponEntity) continue;
 
-        // Read the weapon's actual defIndex from its EconItemView — do NOT write it.
-        // Writing it would corrupt the entity (bug #3 fix).
         uintptr_t attrMgrBase = weaponEntity + schemas::C_EconEntity::m_AttributeManager;
         uintptr_t itemViewPtr = attrMgrBase + schemas::C_AttributeContainer::m_Item;
-        SasLog::Write("tick #%llu: slot[%d] reading defIndex from 0x%llX",
-            tick, i, (unsigned long long)(itemViewPtr + schemas::C_EconItemView::m_iItemDefinitionIndex));
         int defIndex = static_cast<int>(
             MemRead<uint16_t>(itemViewPtr + schemas::C_EconItemView::m_iItemDefinitionIndex));
-        SasLog::Write("tick #%llu: slot[%d] defIndex=%d", tick, i, defIndex);
+
+        // Verbose per-slot logging only on tick 1 — helps diagnose entity walk
+        // correctness without flooding the log at 64 Hz.
+        if (tick == 1) {
+            SasLog::Write("tick #%llu: slot[%d] handle=0x%08X entity=0x%llX defIndex=%d",
+                tick, i, handle, (unsigned long long)weaponEntity, defIndex);
+        }
 
         auto it = skinMap.find(defIndex);
         if (it == skinMap.end()) continue; // no skin assigned for this weapon
 
         const LoadoutSlot& slot = it->second;
 
-        // Trace each write — SasLog flushes after every call, so the last line
-        // before a crash identifies exactly which write caused it.
-        SasLog::Write("tick #%llu: entity=0x%llX defIdx=%d pk=%d wear=%.4f — writing m_iItemIDHigh",
-            tick, (unsigned long long)weaponEntity, defIndex, slot.paintKitId, slot.wear);
+        // Pre-write readback: read current values BEFORE overwriting them.
+        // Pre-write readback diagnostic.  Compare current memory state against
+        // what we wrote last time for this entity.
+        //
+        // Only log when values diverge (means server/prediction wiped them).
+        // Silence = writes persist in memory → rendering is the bottleneck
+        //           (CS2 caches material at weapon spawn, not per-frame).
+        // "OVERWRITTEN" = networking/prediction is the bottleneck.
+        uint32_t preIDHigh = MemRead<uint32_t>(itemViewPtr  + schemas::C_EconItemView::m_iItemIDHigh);
+        int32_t  prePK     = MemRead<int32_t> (weaponEntity + schemas::C_EconEntity::m_nFallbackPaintKit);
+        float    preWear   = MemRead<float>   (weaponEntity + schemas::C_EconEntity::m_flFallbackWear);
 
-        // Invalidate the item ID so the engine uses the fallback paint-kit fields.
-        //
-        // The engine's "use fallback" check tests m_iItemIDHigh (uint32 at
-        // C_EconItemView+0x1D0): values >= 4000000000 (0xEE6B2800) mean "no real
-        // Steam inventory item — use fallback fields."  m_iItemIDHigh and
-        // m_iItemIDLow (0x1D4) are the NETWORKED fields (NetworkVarNames).
-        // m_iItemID (uint64 at 0x1C8) is a separate non-networked cache and is
-        // NOT what the fallback-trigger checks — writing only to 0x1C8 leaves
-        // m_iItemIDHigh untouched and the skin never shows.
-        //
-        // A single 8-byte write at m_iItemIDHigh covers both High (0x1D0) and
-        // Low (0x1D4) atomically (0x1D0 is 8-byte aligned, x86-64 guarantee).
+        auto lastIt = g_lastWritten.find(weaponEntity);
+        if (lastIt == g_lastWritten.end()) {
+            // First time seeing this entity — log initial state.
+            SasLog::Write("tick #%llu: entity=0x%llX defIdx=%d first write; initial IDHigh=0x%08X pk=%d wear=%.4f",
+                tick, (unsigned long long)weaponEntity, defIndex, preIDHigh, prePK, preWear);
+        } else if (preIDHigh != lastIt->second.idHigh ||
+                   prePK     != lastIt->second.pk     ||
+                   preWear   != lastIt->second.wear) {
+            SasLog::Write("tick #%llu: entity=0x%llX defIdx=%d OVERWRITTEN — got IDHigh=0x%08X pk=%d wear=%.4f, expected IDHigh=0xFFFFFFFF pk=%d",
+                tick, (unsigned long long)weaponEntity, defIndex,
+                preIDHigh, prePK, preWear, lastIt->second.pk);
+        }
+
         MemWrite<uint64_t>(itemViewPtr + schemas::C_EconItemView::m_iItemIDHigh,
                            0xFFFFFFFFFFFFFFFFull);
-
-        SasLog::Write("tick #%llu: entity=0x%llX — writing m_nFallbackPaintKit",
-            tick, (unsigned long long)weaponEntity);
         MemWrite<int32_t>(weaponEntity + schemas::C_EconEntity::m_nFallbackPaintKit, slot.paintKitId);
-
-        SasLog::Write("tick #%llu: entity=0x%llX — writing m_flFallbackWear",
-            tick, (unsigned long long)weaponEntity);
         MemWrite<float>  (weaponEntity + schemas::C_EconEntity::m_flFallbackWear,    slot.wear);
 
-        SasLog::Write("tick #%llu: entity=0x%llX — done", tick, (unsigned long long)weaponEntity);
+        g_lastWritten[weaponEntity] = { slot.paintKitId, slot.wear, 0xFFFFFFFFu };
         ++written;
     }
 
-    if (written > 0 || tick % 20 == 1)
-        SasLog::Write("tick #%llu: wrote to %d weapon slot(s)", tick, written);
+    // Heartbeat ~every 5 s so we know the loop is alive even when nothing is new.
+    if (tick % 300 == 1)
+        SasLog::Write("tick #%llu: alive, %d write(s) this tick", tick, written);
 }
 
 static void UpdateLoop()
 {
     while (g_running.load()) {
         ApplySkins();
-        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        // 16 ms ≈ 64 Hz — matches the CS2 server tick rate so that if the server
+        // resets the fallback fields between our writes we overwrite them back
+        // before the next render frame.  At 250 ms we were only "winning" 6% of
+        // the time; at 16 ms we win virtually every frame.
+        std::this_thread::sleep_for(std::chrono::milliseconds(16));
     }
 }
 

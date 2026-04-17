@@ -159,7 +159,7 @@ Published hashes for the current `bin/` contents:
 
 | File | SHA-256 |
 |------|---------|
-| `bin/SovereignHook.dll` | `87931e83c878c8e8a1224d56b950f7c5a6bebf23aedf64e72287b14e761c52ad` |
+| `bin/SovereignHook.dll` | `151afdf8e233eb10e8e518b82c4e568fe5a104ff3ae3d083c71e6b02a58981da` |
 | `bin/MuseumCurator.exe` | `d46d0220aa9957ea0a68078f0214cbcfb6af16c86a48cf85916d31f8e242690f` |
 
 ```powershell

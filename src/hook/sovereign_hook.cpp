@@ -246,11 +246,22 @@ static void ApplySkins()
 
         const LoadoutSlot& slot = it->second;
 
-        // Invalidate the item ID on the EconItemView so the engine falls back
-        // to m_nFallbackPaintKit / m_flFallbackWear for rendering.  As long as
-        // the real item ID is set the fallback fields are silently ignored.
-        MemWrite<uint32_t>(itemViewPtr + schemas::C_EconItemView::m_iItemIDHigh, 0xFFFFFFFFu);
-        MemWrite<uint32_t>(itemViewPtr + schemas::C_EconItemView::m_iItemIDLow,  0xFFFFFFFFu);
+        // Invalidate the economy item ID so the engine uses the fallback fields.
+        //
+        // m_iItemIDHigh/Low (0x1D0/0x1D4) are SEPARATE fields from m_iItemID
+        // (uint64 at 0x1C8); the "use fallback" check reads the uint64.  Writing
+        // the two uint32 split fields was both wrong (checked the wrong offset)
+        // and racy (two non-atomic writes → game could read a torn value between
+        // them).  A single 8-byte write to an 8-byte-aligned address is atomic on
+        // x86-64, so the game always sees either the old value or the new one.
+        //
+        // On a listen server ("map de_dust2") Steam inventory assigns real item
+        // IDs to your weapons.  Setting m_iItemID = UINT64_MAX tells the economy
+        // renderer there is no backing item and it should use the fallback fields.
+        // On a dedicated -insecure server the ID is already UINT64_MAX, so this
+        // write is a no-op.
+        MemWrite<uint64_t>(itemViewPtr + schemas::C_EconItemView::m_iItemID,
+                           0xFFFFFFFFFFFFFFFFull);
 
         MemWrite<int32_t>(weaponEntity + schemas::C_EconEntity::m_nFallbackPaintKit, slot.paintKitId);
         MemWrite<float>  (weaponEntity + schemas::C_EconEntity::m_flFallbackWear,    slot.wear);

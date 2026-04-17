@@ -101,6 +101,22 @@ On startup, `MuseumCurator.exe` looks for a file named `skins.json` in the same 
 
 If found, it reads and parses the file to populate the full skin catalogue (sourced from [ByMykel/CSGO-API](https://github.com/ByMykel/CSGO-API)). If the file is absent, a small built-in fallback list is used instead. The file is read once at startup and never written to. No data from the file is sent anywhere.
 
+### Optional outbound HTTPS request — skins.json download
+
+If `skins.json` is absent from the executable's directory, a banner is shown with a **Download skins.json** button. Clicking it triggers a single outbound HTTPS request.
+
+**APIs used:** `WinHttpOpen`, `WinHttpConnect`, `WinHttpOpenRequest`, `WinHttpSendRequest`, `WinHttpReceiveResponse`, `WinHttpReadData`, `WinHttpCloseHandle`
+
+- **Destination**: `https://raw.githubusercontent.com/ByMykel/CSGO-API/main/public/api/en/skins.json` (port 443, TLS)
+- **What is sent**: A plain GET request with no query parameters, no account data, no machine identifiers.
+- **What is received**: The ByMykel/CSGO-API skin catalogue JSON (~5 MB). It is written to `skins.json` beside the executable and read from disk. No data from the file is sent anywhere.
+- **When it happens**: Only when you explicitly click the button. If `skins.json` already exists, this code path is never reached.
+- **Third-party privacy**: The request is served by GitHub's CDN (raw.githubusercontent.com). Standard GitHub CDN logging applies.
+
+This feature is entirely optional. If you place your own `skins.json` beside the executable, the button is never shown and no request is made.
+
+---
+
 ### Optional outbound HTTPS request — inspect link import
 
 When the user pastes a Steam inspect link into the "Import from Inspect Link" field and clicks Apply, `MuseumCurator.exe` makes a single outbound HTTPS request.
@@ -160,7 +176,7 @@ Published hashes for the current `bin/` contents:
 | File | SHA-256 |
 |------|---------|
 | `bin/SovereignHook.dll` | `302fcb9b43bcd1b28213b01b3187cda764195a3c4182add6da5f375d82a36382` |
-| `bin/MuseumCurator.exe` | `de7c1c7350d47d46b37f47b0123bff7e3a7152403ae7cf58168251ccb1369d6a` |
+| `bin/MuseumCurator.exe` | `a3df2a608772321e9fe2973c2cd14be34dff999fb0025a0c30a7b1d2cd81c8f9` |
 
 ```powershell
 Get-FileHash bin\SovereignHook.dll  -Algorithm SHA256

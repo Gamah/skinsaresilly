@@ -10,9 +10,13 @@
 #endif
 
 #include <wchar.h>
+#include <winhttp.h>
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <cstdio>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "imgui.h"
@@ -57,6 +61,99 @@ static wchar_t g_statusMsg[256]     = L"Ready. CS2 must be running with -insecur
 // Skin catalogue (loaded from skins.json or static fallback)
 static std::vector<DynamicSkin> g_skins;
 static bool                     g_skinsFromJson = false;
+
+// skins.json download state
+//   0 = idle   1 = downloading   2 = done (reload pending)   3 = failed
+static std::atomic<int> g_dlState{0};
+static char             g_dlError[256]{};
+
+// ---------------------------------------------------------------------------
+// DownloadSkinsJson — runs on a background thread.
+// Streams raw.githubusercontent.com to a temp file then renames it into place.
+// ---------------------------------------------------------------------------
+static void DownloadSkinsJson(std::wstring destPath)
+{
+    g_dlError[0] = '\0';
+    std::wstring tempPath = destPath + L".tmp";
+
+    HINTERNET hSess = WinHttpOpen(
+        L"SkinsAreSilly/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSess) {
+        strncpy_s(g_dlError, "WinHttpOpen failed", sizeof(g_dlError));
+        g_dlState.store(3); return;
+    }
+
+    HINTERNET hConn = WinHttpConnect(
+        hSess, L"raw.githubusercontent.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hConn) {
+        WinHttpCloseHandle(hSess);
+        strncpy_s(g_dlError, "WinHttpConnect failed", sizeof(g_dlError));
+        g_dlState.store(3); return;
+    }
+
+    HINTERNET hReq = WinHttpOpenRequest(
+        hConn, L"GET",
+        L"/ByMykel/CSGO-API/main/public/api/en/skins.json",
+        nullptr, WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES,
+        WINHTTP_FLAG_SECURE);
+    if (!hReq) {
+        WinHttpCloseHandle(hConn); WinHttpCloseHandle(hSess);
+        strncpy_s(g_dlError, "WinHttpOpenRequest failed", sizeof(g_dlError));
+        g_dlState.store(3); return;
+    }
+
+    bool ok = WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                 WINHTTP_NO_REQUEST_DATA, 0, 0, 0)
+           && WinHttpReceiveResponse(hReq, nullptr);
+    if (!ok) {
+        WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConn); WinHttpCloseHandle(hSess);
+        strncpy_s(g_dlError, "Network request failed — check your connection", sizeof(g_dlError));
+        g_dlState.store(3); return;
+    }
+
+    DWORD statusCode = 0, statusSize = sizeof(statusCode);
+    WinHttpQueryHeaders(hReq,
+        WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+        WINHTTP_HEADER_NAME_BY_INDEX,
+        &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
+    if (statusCode != 200) {
+        WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConn); WinHttpCloseHandle(hSess);
+        snprintf(g_dlError, sizeof(g_dlError), "HTTP %lu", statusCode);
+        g_dlState.store(3); return;
+    }
+
+    FILE* f = _wfopen(tempPath.c_str(), L"wb");
+    if (!f) {
+        WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConn); WinHttpCloseHandle(hSess);
+        strncpy_s(g_dlError, "Could not write temp file (check directory permissions)", sizeof(g_dlError));
+        g_dlState.store(3); return;
+    }
+
+    char buf[8192]; DWORD n = 0; bool writeOk = true;
+    while (WinHttpReadData(hReq, buf, sizeof(buf), &n) && n > 0) {
+        if (fwrite(buf, 1, n, f) != n) { writeOk = false; break; }
+    }
+    fclose(f);
+    WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConn); WinHttpCloseHandle(hSess);
+
+    if (!writeOk) {
+        _wremove(tempPath.c_str());
+        strncpy_s(g_dlError, "Write error — disk full?", sizeof(g_dlError));
+        g_dlState.store(3); return;
+    }
+
+    _wremove(destPath.c_str());
+    if (_wrename(tempPath.c_str(), destPath.c_str()) != 0) {
+        _wremove(tempPath.c_str());
+        strncpy_s(g_dlError, "Could not rename temp file to skins.json", sizeof(g_dlError));
+        g_dlState.store(3); return;
+    }
+
+    g_dlState.store(2); // success — main loop will reload
+}
 
 // Loadout
 static Loadout       g_loadout;
@@ -237,6 +334,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
         }
         if (done) break;
 
+        // Reload skins catalogue after a successful download (state 2 is set by
+        // the download thread; we do the actual reload on the UI thread).
+        if (g_dlState.load() == 2) {
+            std::wstring jsonPath = GetExeDir() + L"skins.json";
+            auto loaded = LoadSkinsJson(jsonPath);
+            if (!loaded.empty()) {
+                g_skins         = std::move(loaded);
+                g_skinsFromJson = true;
+                BuildWeaponList();
+                CuratorLog::Write("skins.json downloaded — reloaded %d skins", (int)g_skins.size());
+            }
+            g_dlState.store(0);
+        }
+
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
@@ -303,11 +414,38 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
 
         // ---- Demo mode ----
         ImGui::Checkbox("Demo Mode  (no injection \xe2\x80\x94 UI preview only)", &g_demoMode);
-        if (!g_skinsFromJson) {
-            ImGui::SameLine(0, 16.0f);
-            ImGui::TextDisabled("(static catalogue \xe2\x80\x94 put skins.json beside the exe for all skins)");
-        }
         ImGui::Spacing();
+
+        // ---- skins.json download banner ----
+        if (!g_skinsFromJson) {
+            int dlState = g_dlState.load();
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.18f, 0.14f, 0.06f, 1.0f));
+            ImGui::BeginChild("##dlbanner", {-1.0f, 42.0f}, false);
+            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 4.0f);
+            ImGui::TextDisabled("Using built-in skin list (%d skins).  Download the full catalogue for all %d00+ skins:",
+                (int)g_skins.size(), (int)g_skins.size() / 100 + 1);
+            ImGui::SameLine(0, 12.0f);
+            if (dlState == 1) {
+                ImGui::BeginDisabled();
+                ImGui::Button("Downloading skins.json...", {0.0f, 0.0f});
+                ImGui::EndDisabled();
+            } else {
+                if (ImGui::Button(dlState == 3 ? "Retry Download" : "Download skins.json", {0.0f, 0.0f})) {
+                    g_dlState.store(1);
+                    std::thread(DownloadSkinsJson, GetExeDir() + L"skins.json").detach();
+                    CuratorLog::Write("Downloading skins.json from ByMykel/CSGO-API");
+                }
+                if (dlState == 3) {
+                    ImGui::SameLine(0, 8.0f);
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.4f, 0.4f, 1.0f));
+                    ImGui::TextUnformatted(g_dlError);
+                    ImGui::PopStyleColor();
+                }
+            }
+            ImGui::EndChild();
+            ImGui::PopStyleColor();
+            ImGui::Spacing();
+        }
 
         // ====================================================================
         // Two-column layout: left = loadout table, right = skin picker

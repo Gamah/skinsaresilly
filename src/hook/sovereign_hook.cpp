@@ -105,7 +105,7 @@ std::atomic<uint64_t> g_tickCount{0};
 // Per-entity last-written state used to suppress redundant readback logs.
 // Key = weapon entity address.  We only log when the pre-write value diverges
 // from what we wrote last time (meaning the server/prediction wiped it).
-struct WrittenState { int32_t pk; float wear; uint32_t idHigh; };
+struct WrittenState { int32_t pk; float wear; uint32_t idHigh; uint64_t itemID; };
 std::unordered_map<uintptr_t, WrittenState> g_lastWritten;
 uint32_t g_lastLoadoutVersion = 0;
 
@@ -271,9 +271,15 @@ static void ApplySkins()
         // what we wrote last time for this entity.
         //
         // Only log when values diverge (means server/prediction wiped them).
-        // Silence = writes persist in memory → rendering is the bottleneck
-        //           (CS2 caches material at weapon spawn, not per-frame).
-        // "OVERWRITTEN" = networking/prediction is the bottleneck.
+        // Silence = writes persist in memory.
+        // "OVERWRITTEN" = networking/prediction is wiping our values.
+        //
+        // m_iItemID (0x1C8) is the non-networked uint64 cache the renderer reads for
+        // "is this a valid GC item?" — this is DISTINCT from the networked m_iItemIDHigh
+        // (0x1D0) / m_iItemIDLow (0x1D4).  We must write both: the networked fields so
+        // that if the engine re-syncs the cache from High+Low it still sees 0xFFFF…,
+        // and the cache field itself so the renderer immediately sees an invalid ID.
+        uint64_t preItemID = MemRead<uint64_t>(itemViewPtr  + schemas::C_EconItemView::m_iItemID);
         uint32_t preIDHigh = MemRead<uint32_t>(itemViewPtr  + schemas::C_EconItemView::m_iItemIDHigh);
         int32_t  prePK     = MemRead<int32_t> (weaponEntity + schemas::C_EconEntity::m_nFallbackPaintKit);
         float    preWear   = MemRead<float>   (weaponEntity + schemas::C_EconEntity::m_flFallbackWear);
@@ -281,22 +287,28 @@ static void ApplySkins()
         auto lastIt = g_lastWritten.find(weaponEntity);
         if (lastIt == g_lastWritten.end()) {
             // First time seeing this entity — log initial state.
-            SasLog::Write("tick #%llu: entity=0x%llX defIdx=%d first write; initial IDHigh=0x%08X pk=%d wear=%.4f",
-                tick, (unsigned long long)weaponEntity, defIndex, preIDHigh, prePK, preWear);
-        } else if (preIDHigh != lastIt->second.idHigh ||
+            SasLog::Write("tick #%llu: entity=0x%llX defIdx=%d first write; "
+                          "initial ItemID=0x%llX IDHigh=0x%08X pk=%d wear=%.4f",
+                tick, (unsigned long long)weaponEntity, defIndex,
+                (unsigned long long)preItemID, preIDHigh, prePK, preWear);
+        } else if (preItemID != lastIt->second.itemID ||
+                   preIDHigh != lastIt->second.idHigh ||
                    prePK     != lastIt->second.pk     ||
                    preWear   != lastIt->second.wear) {
-            SasLog::Write("tick #%llu: entity=0x%llX defIdx=%d OVERWRITTEN — got IDHigh=0x%08X pk=%d wear=%.4f, expected IDHigh=0xFFFFFFFF pk=%d",
+            SasLog::Write("tick #%llu: entity=0x%llX defIdx=%d OVERWRITTEN — "
+                          "ItemID=0x%llX IDHigh=0x%08X pk=%d wear=%.4f",
                 tick, (unsigned long long)weaponEntity, defIndex,
-                preIDHigh, prePK, preWear, lastIt->second.pk);
+                (unsigned long long)preItemID, preIDHigh, prePK, preWear);
         }
 
-        MemWrite<uint64_t>(itemViewPtr + schemas::C_EconItemView::m_iItemIDHigh,
-                           0xFFFFFFFFFFFFFFFFull);
+        // Invalidate the non-networked item ID cache (what the renderer actually reads).
+        MemWrite<uint64_t>(itemViewPtr + schemas::C_EconItemView::m_iItemID,     0xFFFFFFFFFFFFFFFFull);
+        // Also cover the networked split fields so a re-sync from High+Low still sees invalid.
+        MemWrite<uint64_t>(itemViewPtr + schemas::C_EconItemView::m_iItemIDHigh, 0xFFFFFFFFFFFFFFFFull);
         MemWrite<int32_t>(weaponEntity + schemas::C_EconEntity::m_nFallbackPaintKit, slot.paintKitId);
         MemWrite<float>  (weaponEntity + schemas::C_EconEntity::m_flFallbackWear,    slot.wear);
 
-        g_lastWritten[weaponEntity] = { slot.paintKitId, slot.wear, 0xFFFFFFFFu };
+        g_lastWritten[weaponEntity] = { slot.paintKitId, slot.wear, 0xFFFFFFFFu, 0xFFFFFFFFFFFFFFFFull };
         ++written;
     }
 

@@ -164,17 +164,6 @@ static void ApplySkins()
         return;
     }
 
-    // Get the InventoryServices sub-object.
-    // Field: CCSPlayerController::m_pInventoryServices (offset 0x810)
-    // This is the loadout/inventory pointer, NOT m_pInGameMoneyServices (0x808).
-    uintptr_t inventoryServicesPtr = MemRead<uintptr_t>(
-        localControllerPtr +
-        schemas::CCSPlayerController::m_pInventoryServices);
-    if (!inventoryServicesPtr) {
-        SasLog::Write("tick #%llu: inventoryServicesPtr is null — wrong offset? verify client_dll.hpp", tick);
-        return;
-    }
-
     // Read entity list base.
     uintptr_t entityListBase = MemRead<uintptr_t>(
         clientBase + offsets::dwEntityList);
@@ -183,14 +172,46 @@ static void ApplySkins()
         return;
     }
 
-    // Walk the loadout slot array (64 slots: pistols, rifles, knives, etc.)
-    constexpr int LOADOUT_SLOTS = 64;
-    uintptr_t loadoutArray = inventoryServicesPtr +
-        schemas::CCSPlayerController_InventoryServices::m_vecNetworkableLoadout;
+    // Resolve the local player pawn from the controller.
+    // m_hPlayerPawn is a CHandle (uint32) — must be resolved via EntityFromHandle.
+    uint32_t pawnHandle = MemRead<uint32_t>(
+        localControllerPtr + schemas::CCSPlayerController::m_hPlayerPawn);
+    uintptr_t pawnEntity = EntityFromHandle(entityListBase, pawnHandle);
+    if (!pawnEntity) {
+        if (tick % 20 == 1)
+            SasLog::Write("tick #%llu: pawn entity is null — not spawned yet?", tick);
+        return;
+    }
+
+    // Get weapon services from the pawn (team-agnostic; contains all carried weapons).
+    // Previously used m_vecNetworkableLoadout on InventoryServices, which is a CUtlVector
+    // of NetworkedLoadoutSlot_t structs — not entity handles — and is split by team slot
+    // index, causing T-side weapons to be missed entirely.
+    uintptr_t weaponServicesPtr = MemRead<uintptr_t>(
+        pawnEntity + schemas::C_BasePlayerPawn::m_pWeaponServices);
+    if (!weaponServicesPtr) {
+        SasLog::Write("tick #%llu: weaponServicesPtr is null", tick);
+        return;
+    }
+
+    // m_hMyWeapons is C_NetworkUtlVectorBase<CHandle<C_BasePlayerWeapon>> (24 bytes):
+    //   +0x00  T*      data pointer
+    //   +0x08  int32   allocation count
+    //   +0x0C  int32   grow size
+    //   +0x10  int32   element count (m_Size)
+    uintptr_t weaponsBase = weaponServicesPtr + schemas::CPlayer_WeaponServices::m_hMyWeapons;
+    uintptr_t weaponsDataPtr = MemRead<uintptr_t>(weaponsBase + 0x00);
+    int32_t   weaponsCount   = MemRead<int32_t> (weaponsBase + 0x10);
+
+    if (!weaponsDataPtr || weaponsCount <= 0 || weaponsCount > 64) {
+        if (tick % 20 == 1)
+            SasLog::Write("tick #%llu: weapon list empty or invalid (count=%d)", tick, weaponsCount);
+        return;
+    }
 
     int written = 0;
-    for (int i = 0; i < LOADOUT_SLOTS; ++i) {
-        uint32_t handle = MemRead<uint32_t>(loadoutArray + i * sizeof(uint32_t));
+    for (int i = 0; i < weaponsCount; ++i) {
+        uint32_t handle = MemRead<uint32_t>(weaponsDataPtr + i * sizeof(uint32_t));
         if (handle == 0 || handle == 0xFFFFFFFF) continue;
 
         uintptr_t weaponEntity = EntityFromHandle(entityListBase, handle);

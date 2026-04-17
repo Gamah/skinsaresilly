@@ -69,7 +69,12 @@ static void MemWrite(uintptr_t addr, T val)
 // ---------------------------------------------------------------------------
 static constexpr uint32_t  ENT_ENTRY_MASK  = 0x7FFF;
 static constexpr uint32_t  ENT_CHUNK_SIZE  = 512;
-static constexpr uintptr_t ENT_PTR_STRIDE  = 0x78;   // sizeof(CEntityIdentity)
+static constexpr uintptr_t ENT_PTR_STRIDE  = 0x70;   // sizeof(CEntityIdentity) — hl2sdk layout:
+                                                       // m_pNextByClass at 0x68 (+8) = 0x70 total,
+                                                       // padded to 8-byte alignment. 0x78 was wrong
+                                                       // and caused m_pClass to be read as m_pInstance
+                                                       // for every slot > 0, producing a garbage entity
+                                                       // pointer that crashed on the weapon-services walk.
 static constexpr uintptr_t ENT_LIST_OFFSET = 0x10;   // CEntitySystem::m_EntityList offset
 
 static uintptr_t EntityFromHandle(uintptr_t entityListBase, uint32_t handle)
@@ -246,6 +251,11 @@ static void ApplySkins()
 
         const LoadoutSlot& slot = it->second;
 
+        // Trace each write — SasLog flushes after every call, so the last line
+        // before a crash identifies exactly which write caused it.
+        SasLog::Write("tick #%llu: entity=0x%llX defIdx=%d pk=%d wear=%.4f — writing m_iItemID",
+            tick, (unsigned long long)weaponEntity, defIndex, slot.paintKitId, slot.wear);
+
         // Invalidate the economy item ID so the engine uses the fallback fields.
         //
         // m_iItemIDHigh/Low (0x1D0/0x1D4) are SEPARATE fields from m_iItemID
@@ -263,8 +273,15 @@ static void ApplySkins()
         MemWrite<uint64_t>(itemViewPtr + schemas::C_EconItemView::m_iItemID,
                            0xFFFFFFFFFFFFFFFFull);
 
+        SasLog::Write("tick #%llu: entity=0x%llX — writing m_nFallbackPaintKit",
+            tick, (unsigned long long)weaponEntity);
         MemWrite<int32_t>(weaponEntity + schemas::C_EconEntity::m_nFallbackPaintKit, slot.paintKitId);
+
+        SasLog::Write("tick #%llu: entity=0x%llX — writing m_flFallbackWear",
+            tick, (unsigned long long)weaponEntity);
         MemWrite<float>  (weaponEntity + schemas::C_EconEntity::m_flFallbackWear,    slot.wear);
+
+        SasLog::Write("tick #%llu: entity=0x%llX — done", tick, (unsigned long long)weaponEntity);
         ++written;
     }
 

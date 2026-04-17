@@ -176,10 +176,15 @@ static void ApplySkins()
     // m_hPlayerPawn is a CHandle (uint32) — must be resolved via EntityFromHandle.
     uint32_t pawnHandle = MemRead<uint32_t>(
         localControllerPtr + schemas::CCSPlayerController::m_hPlayerPawn);
+    if (pawnHandle == 0xFFFFFFFF || pawnHandle == 0) {
+        if (tick % 20 == 1)
+            SasLog::Write("tick #%llu: pawn handle invalid (0x%08X) — not spawned yet", tick, pawnHandle);
+        return;
+    }
     uintptr_t pawnEntity = EntityFromHandle(entityListBase, pawnHandle);
     if (!pawnEntity) {
-        if (tick % 20 == 1)
-            SasLog::Write("tick #%llu: pawn entity is null — not spawned yet?", tick);
+        // Handle was non-trivial but entity resolved to null — log every tick so we notice.
+        SasLog::Write("tick #%llu: pawn handle 0x%08X resolved to null entity — stale list?", tick, pawnHandle);
         return;
     }
 
@@ -228,6 +233,13 @@ static void ApplySkins()
         if (it == skinMap.end()) continue; // no skin assigned for this weapon
 
         const LoadoutSlot& slot = it->second;
+
+        // Invalidate the item ID on the EconItemView so the engine falls back
+        // to m_nFallbackPaintKit / m_flFallbackWear for rendering.  As long as
+        // the real item ID is set the fallback fields are silently ignored.
+        MemWrite<uint32_t>(itemViewPtr + schemas::C_EconItemView::m_iItemIDHigh, 0xFFFFFFFFu);
+        MemWrite<uint32_t>(itemViewPtr + schemas::C_EconItemView::m_iItemIDLow,  0xFFFFFFFFu);
+
         MemWrite<int32_t>(weaponEntity + schemas::C_EconEntity::m_nFallbackPaintKit, slot.paintKitId);
         MemWrite<float>  (weaponEntity + schemas::C_EconEntity::m_flFallbackWear,    slot.wear);
         ++written;

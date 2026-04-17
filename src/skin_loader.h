@@ -76,11 +76,19 @@ inline std::vector<DynamicSkin> LoadSkinsJson(const std::wstring& jsonPath) {
     for (const auto& item : j) {
         try {
             if (!item.is_object()) continue;
-            if (!item.contains("paint_index") || !item["paint_index"].is_number_integer()) continue;
+            if (!item.contains("paint_index")) continue;
 
             DynamicSkin s;
-            s.name      = item.value("name", "");
-            s.paintKitId = item["paint_index"].get<int>();
+            s.name = item.value("name", "");
+
+            // ByMykel skins.json stores paint_index as a string ("279"), not an integer.
+            // Handle both representations.
+            if (item["paint_index"].is_number_integer())
+                s.paintKitId = item["paint_index"].get<int>();
+            else if (item["paint_index"].is_string())
+                try { s.paintKitId = std::stoi(item["paint_index"].get<std::string>()); }
+                catch (...) { continue; }
+            else continue;
             if (s.name.empty() || s.paintKitId == 0) continue;
 
             if (item.contains("weapon") && item["weapon"].is_object()) {

@@ -264,24 +264,22 @@ static void ApplySkins()
 
         // Trace each write — SasLog flushes after every call, so the last line
         // before a crash identifies exactly which write caused it.
-        SasLog::Write("tick #%llu: entity=0x%llX defIdx=%d pk=%d wear=%.4f — writing m_iItemID",
+        SasLog::Write("tick #%llu: entity=0x%llX defIdx=%d pk=%d wear=%.4f — writing m_iItemIDHigh",
             tick, (unsigned long long)weaponEntity, defIndex, slot.paintKitId, slot.wear);
 
-        // Invalidate the economy item ID so the engine uses the fallback fields.
+        // Invalidate the item ID so the engine uses the fallback paint-kit fields.
         //
-        // m_iItemIDHigh/Low (0x1D0/0x1D4) are SEPARATE fields from m_iItemID
-        // (uint64 at 0x1C8); the "use fallback" check reads the uint64.  Writing
-        // the two uint32 split fields was both wrong (checked the wrong offset)
-        // and racy (two non-atomic writes → game could read a torn value between
-        // them).  A single 8-byte write to an 8-byte-aligned address is atomic on
-        // x86-64, so the game always sees either the old value or the new one.
+        // The engine's "use fallback" check tests m_iItemIDHigh (uint32 at
+        // C_EconItemView+0x1D0): values >= 4000000000 (0xEE6B2800) mean "no real
+        // Steam inventory item — use fallback fields."  m_iItemIDHigh and
+        // m_iItemIDLow (0x1D4) are the NETWORKED fields (NetworkVarNames).
+        // m_iItemID (uint64 at 0x1C8) is a separate non-networked cache and is
+        // NOT what the fallback-trigger checks — writing only to 0x1C8 leaves
+        // m_iItemIDHigh untouched and the skin never shows.
         //
-        // On a listen server ("map de_dust2") Steam inventory assigns real item
-        // IDs to your weapons.  Setting m_iItemID = UINT64_MAX tells the economy
-        // renderer there is no backing item and it should use the fallback fields.
-        // On a dedicated -insecure server the ID is already UINT64_MAX, so this
-        // write is a no-op.
-        MemWrite<uint64_t>(itemViewPtr + schemas::C_EconItemView::m_iItemID,
+        // A single 8-byte write at m_iItemIDHigh covers both High (0x1D0) and
+        // Low (0x1D4) atomically (0x1D0 is 8-byte aligned, x86-64 guarantee).
+        MemWrite<uint64_t>(itemViewPtr + schemas::C_EconItemView::m_iItemIDHigh,
                            0xFFFFFFFFFFFFFFFFull);
 
         SasLog::Write("tick #%llu: entity=0x%llX — writing m_nFallbackPaintKit",

@@ -110,20 +110,32 @@ std::atomic<uint64_t> g_tickCount{0};
 struct EntityState {
     int32_t  lastPK;
     float    lastWear;
-    uint32_t pduVersion;  // loadout version when PostDataUpdate last fired
+    uint32_t pduVersion;   // loadout version when PDU cycle last fired
+    uint64_t lastPDUTick;  // tick when PDU cycle last fired (for retry interval)
 };
 std::unordered_map<uintptr_t, EntityState> g_entityState;
 uint32_t g_lastLoadoutVersion = 0;
 
-// PostDataUpdate vtable index in CEntityInstance (hl2sdk-cs2 layout, MSVC ABI).
-// CEntityInstance vtable:
-//   [0] unk001  [1] unk002  [2] GetScriptDesc  [3] ~dtor
-//   [4] Connect [5] Disconnect [6] Precache [7] AddedToEntityDatabase
-//   [8] Spawn   [9] unk101   [10] PostDataUpdate  ← index we call
-// DATA_UPDATE_DATATABLE_CHANGED = 1  (fields changed, rebuild from current state)
-static constexpr int   kPDU_VtableIdx = 10;
-static constexpr int   kDATA_UPDATE_DATATABLE_CHANGED = 1;
-typedef void (*PostDataUpdate_t)(void*, int);
+// CEntityInstance vtable indices (hl2sdk-cs2, MSVC ABI — 1 destructor slot):
+//   [0]unk001 [1]unk002 [2]GetScriptDesc [3]~dtor [4]Connect [5]Disconnect
+//   [6]Precache [7]AddedToEntityDatabase [8]Spawn [9]unk101
+//   [10]PostDataUpdate  [11]OnDataUnchangedInPVS [12]Activate [13]UpdateOnRemove
+//   [14]OnSetDormant [15]ScriptEntityIO [16]ScriptAcceptInput [17]PreDataUpdate
+//
+// DATA_UPDATE_CREATED (0) = full entity re-init from scratch (triggers the
+// complete attribute + visual setup path, not just an incremental delta).
+//
+// Correct call order for the engine's change detection to work:
+//   1. PreDataUpdate(type)  — snapshots current state as "before"
+//   2. write new field values
+//   3. PostDataUpdate(type) — computes delta (before → after) and runs init path
+//
+// Without PreDataUpdate, PostDataUpdate compares to a stale snapshot and may
+// see no delta, skipping the skin setup entirely.
+static constexpr int   kPreDataUpdate_VtableIdx = 17;
+static constexpr int   kPDU_VtableIdx           = 10;
+static constexpr int   kDATA_UPDATE_CREATED      = 0;
+typedef void (*PrePostDataUpdate_t)(void*, int);
 
 // ---------------------------------------------------------------------------
 // ApplySkins — reads the full per-weapon loadout from shared memory, walks the
@@ -298,60 +310,73 @@ static void ApplySkins()
                 tick, (unsigned long long)weaponEntity, defIndex, curPK, curWear);
         }
 
-        // ---- Write skin fields ----
+        // ---- Pre/PostDataUpdate cycle ----
         //
-        // m_iItemIDHigh = 1 marks this as a "foreign" item (non-zero, not a real
-        // GC item) so the engine uses the fallback fields instead of looking up
-        // attributes from the item cache.  We avoid 0xFFFFFFFF which some code
-        // paths treat as "explicitly invalid / skip".
+        // PreDataUpdate snapshots the entity's current state.  We then write our
+        // skin fields.  PostDataUpdate computes the delta and runs the full entity
+        // init path (attribute load → paint kit lookup → visual setup).
         //
-        // m_bAttributesInitialized is left TRUE (its natural state for bare
-        // weapons).  The engine's visual-rebuild condition is:
-        //   attribInit==true AND visualsSet==false AND ItemID!=0
-        // Clearing attribInit breaks the condition; we must not touch it.
+        // DATA_UPDATE_CREATED (0) triggers the complete re-init path, not just an
+        // incremental field delta.  Without PreDataUpdate the snapshot is stale
+        // and PostDataUpdate may see no changes, skipping the visual setup.
         //
-        // m_bVisualsDataSet stays FALSE (already false for bare weapons) to
-        // signal the engine that visuals need (re)building.
+        // m_bClearWeaponIdentifyingUGC is explicitly cleared; when true it
+        // suppresses skin/UGC rendering for the weapon regardless of other fields.
+        //
+        // We repeat this cycle every 60 ticks (~1 s) until m_bVisualsDataSet
+        // transitions to true, then stop re-firing (skin is confirmed applied).
+        // Once visualsSet is true the skin persists until the entity is replaced.
+        bool visualsNeedFire = loadoutChange || (!curVisuals && tick - es.lastPDUTick >= 60);
+
+        if (visualsNeedFire) {
+            uintptr_t vtablePtr = MemRead<uintptr_t>(weaponEntity);
+            if (vtablePtr) {
+                uintptr_t preFn  = MemRead<uintptr_t>(vtablePtr + kPreDataUpdate_VtableIdx * sizeof(uintptr_t));
+                uintptr_t postFn = MemRead<uintptr_t>(vtablePtr + kPDU_VtableIdx          * sizeof(uintptr_t));
+
+                // 1. Snapshot "before" state.
+                if (preFn) {
+                    reinterpret_cast<PrePostDataUpdate_t>(preFn)(
+                        reinterpret_cast<void*>(weaponEntity), kDATA_UPDATE_CREATED);
+                }
+
+                // 2. Write skin fields AFTER the snapshot.
+                MemWrite<uint32_t>(itemViewPtr + schemas::C_EconItemView::m_iItemIDHigh, 1u);
+                MemWrite<uint32_t>(itemViewPtr + schemas::C_EconItemView::m_iItemIDLow,  0u);
+                MemWrite<uint64_t>(itemViewPtr + schemas::C_EconItemView::m_iItemID,     0x0000000100000000ULL);
+                MemWrite<bool>    (itemViewPtr + schemas::C_EconItemView::m_bInitialized, true);
+                MemWrite<int32_t> (weaponEntity + schemas::C_EconEntity::m_nFallbackPaintKit, slot.paintKitId);
+                MemWrite<float>   (weaponEntity + schemas::C_EconEntity::m_flFallbackWear,    slot.wear);
+                MemWrite<bool>    (weaponEntity + schemas::C_CSWeaponBase::m_bClearWeaponIdentifyingUGC, false);
+
+                // 3. Signal changes → triggers attribute load + visual rebuild.
+                if (postFn) {
+                    reinterpret_cast<PrePostDataUpdate_t>(postFn)(
+                        reinterpret_cast<void*>(weaponEntity), kDATA_UPDATE_CREATED);
+                }
+
+                bool newVisuals = MemRead<bool>(weaponEntity + schemas::C_CSWeaponBase::m_bVisualsDataSet);
+                SasLog::Write("tick #%llu: entity=0x%llX defIdx=%d PDU cycle fired "
+                              "(pre[17]=0x%llX post[10]=0x%llX) pk=%d → visualsSet=%d",
+                    tick, (unsigned long long)weaponEntity, defIndex,
+                    (unsigned long long)preFn, (unsigned long long)postFn,
+                    slot.paintKitId, (int)newVisuals);
+            }
+            es.pduVersion  = loadoutVersion;
+            es.lastPDUTick = tick;
+        }
+
+        // Re-assert field values every tick (in case server resets them).
         MemWrite<uint32_t>(itemViewPtr + schemas::C_EconItemView::m_iItemIDHigh, 1u);
         MemWrite<uint32_t>(itemViewPtr + schemas::C_EconItemView::m_iItemIDLow,  0u);
         MemWrite<uint64_t>(itemViewPtr + schemas::C_EconItemView::m_iItemID,     0x0000000100000000ULL);
         MemWrite<bool>    (itemViewPtr + schemas::C_EconItemView::m_bInitialized, true);
         MemWrite<int32_t> (weaponEntity + schemas::C_EconEntity::m_nFallbackPaintKit, slot.paintKitId);
         MemWrite<float>   (weaponEntity + schemas::C_EconEntity::m_flFallbackWear,    slot.wear);
-        // Keep m_bVisualsDataSet false (already false; don't write true here).
+        MemWrite<bool>    (weaponEntity + schemas::C_CSWeaponBase::m_bClearWeaponIdentifyingUGC, false);
 
         es.lastPK   = slot.paintKitId;
         es.lastWear = slot.wear;
-
-        // ---- Call PostDataUpdate to trigger engine re-initialization ----
-        //
-        // Direct memory writes don't notify the engine that entity state changed.
-        // PostDataUpdate(DATA_UPDATE_DATATABLE_CHANGED) is what the engine calls
-        // when a network packet updates entity fields; it triggers the attribute
-        // manager to re-read item data, look up the fallback paint kit, and
-        // rebuild the weapon's visual state (setting m_bVisualsDataSet = true).
-        //
-        // We call it once per entity per loadout version so the engine runs the
-        // full init path with our written values.
-        if (loadoutChange) {
-            uintptr_t vtablePtr = MemRead<uintptr_t>(weaponEntity);
-            if (vtablePtr) {
-                uintptr_t fnAddr = MemRead<uintptr_t>(vtablePtr + kPDU_VtableIdx * sizeof(uintptr_t));
-                if (fnAddr) {
-                    auto fn = reinterpret_cast<PostDataUpdate_t>(fnAddr);
-                    fn(reinterpret_cast<void*>(weaponEntity), kDATA_UPDATE_DATATABLE_CHANGED);
-                    SasLog::Write("tick #%llu: entity=0x%llX defIdx=%d PostDataUpdate fired "
-                                  "(vtable[%d]=0x%llX) pk=%d wear=%.4f",
-                        tick, (unsigned long long)weaponEntity, defIndex,
-                        kPDU_VtableIdx, (unsigned long long)fnAddr,
-                        slot.paintKitId, slot.wear);
-                } else {
-                    SasLog::Write("tick #%llu: entity=0x%llX defIdx=%d vtable[%d] is null — skipping PDU",
-                        tick, (unsigned long long)weaponEntity, defIndex, kPDU_VtableIdx);
-                }
-            }
-            es.pduVersion = loadoutVersion;
-        }
 
         ++written;
     }

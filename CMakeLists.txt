@@ -62,6 +62,16 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(cs2_dumper)
 
+# Always pull the latest offsets before building SovereignHook.
+# cs2-dumper is updated by the community after every CS2 patch; stale offsets
+# cause immediate game crashes. This target runs on every cmake --build.
+add_custom_target(cs2_dumper_refresh ALL
+    COMMAND git -C "${cs2_dumper_SOURCE_DIR}" fetch --depth=1 origin main
+    COMMAND git -C "${cs2_dumper_SOURCE_DIR}" reset --hard FETCH_HEAD
+    COMMENT "Refreshing cs2-dumper offsets from GitHub..."
+    VERBATIM
+)
+
 # The generated headers live in output/ — expose that path as an include dir
 set(CS2_DUMPER_INCLUDE_DIR ${cs2_dumper_SOURCE_DIR}/output)
 
@@ -112,6 +122,7 @@ set_target_properties(SovereignHook PROPERTIES
     PREFIX ""
     OUTPUT_NAME "SovereignHook"
 )
+add_dependencies(SovereignHook cs2_dumper_refresh)
 
 # ---------------------------------------------------------------------------
 # Target 2: MuseumCurator.exe — UI + injector

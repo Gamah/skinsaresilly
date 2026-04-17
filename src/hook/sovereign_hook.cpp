@@ -1,5 +1,6 @@
 #include "sovereign_hook.h"
 #include "shared_skin_state.h"
+#include "sas_log.h"
 
 #include <windows.h>
 #include <psapi.h>
@@ -77,8 +78,9 @@ static uintptr_t EntityFromHandle(uintptr_t entityListBase, uint32_t handle)
 // ---------------------------------------------------------------------------
 namespace {
 
-std::atomic<bool> g_running{false};
-std::thread       g_updateThread;
+std::atomic<bool>    g_running{false};
+std::thread          g_updateThread;
+std::atomic<uint64_t> g_tickCount{0};
 
 // ---------------------------------------------------------------------------
 // ApplySkins — reads the current skin selection from shared memory (written by
@@ -100,15 +102,23 @@ std::thread       g_updateThread;
 // ---------------------------------------------------------------------------
 static void ApplySkins()
 {
+    uint64_t tick = ++g_tickCount;
+
     // Read skin selection from shared memory written by MuseumCurator.exe.
     HANDLE hMap = OpenFileMappingW(FILE_MAP_READ, FALSE, SKINSARESILLY_SHMEM_NAME);
-    if (!hMap) return; // UI not running
+    if (!hMap) {
+        if (tick == 1)
+            SasLog::Write("tick #%llu: OpenFileMapping returned NULL — MuseumCurator not running?", tick);
+        return;
+    }
 
     const auto* state = static_cast<const SharedSkinState*>(
         MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, sizeof(SharedSkinState)));
     if (!state || state->weaponDefIndex == 0) {
         if (state) UnmapViewOfFile(state);
         CloseHandle(hMap);
+        if (tick == 1)
+            SasLog::Write("tick #%llu: shmem mapped but weaponDefIndex==0 — select a skin first", tick);
         return;
     }
 
@@ -118,33 +128,63 @@ static void ApplySkins()
     UnmapViewOfFile(state);
     CloseHandle(hMap);
 
+    SasLog::Write("tick #%llu: defIdx=%d paintKit=%d wear=%.4f",
+        tick, desiredDefIndex, paintKitId, wear);
+
     // Resolve client.dll base — we are already inside the process
     uintptr_t clientBase = reinterpret_cast<uintptr_t>(GetModuleHandleA("client.dll"));
-    if (!clientBase) return;
+    SasLog::Write("tick #%llu: client.dll base = 0x%llx", tick, (unsigned long long)clientBase);
+    if (!clientBase) {
+        SasLog::Write("tick #%llu: client.dll not found — aborting", tick);
+        return;
+    }
 
     // Read the global pointer to the local player controller
     uintptr_t localControllerPtr = MemRead<uintptr_t>(
         clientBase + offsets::dwLocalPlayerController);
-    if (!localControllerPtr) return;
+    SasLog::Write("tick #%llu: localControllerPtr = 0x%llx  (offset 0x%llx)",
+        tick, (unsigned long long)localControllerPtr,
+        (unsigned long long)offsets::dwLocalPlayerController);
+    if (!localControllerPtr) {
+        SasLog::Write("tick #%llu: localControllerPtr is null — not in-game yet?", tick);
+        return;
+    }
 
-    // Get the InventoryServices sub-object
+    // Get the InventoryServices sub-object.
+    // NOTE: m_pInGameMoneyServices is used as a placeholder for the inventory
+    // services field. Verify this field name against the current client_dll.hpp
+    // if the pointer below resolves to a nonsense address and the game crashes.
     uintptr_t inventoryServicesPtr = MemRead<uintptr_t>(
         localControllerPtr +
-        schemas::CCSPlayerController::m_pInGameMoneyServices); // placeholder field name
-    // NOTE: the exact field name for inventory services in the current dump may differ.
-    // Check client_dll.hpp for CCSPlayerController fields referencing inventory or loadout.
-    if (!inventoryServicesPtr) return;
+        schemas::CCSPlayerController::m_pInGameMoneyServices);
+    SasLog::Write("tick #%llu: inventoryServicesPtr = 0x%llx  (field offset 0x%llx)",
+        tick, (unsigned long long)inventoryServicesPtr,
+        (unsigned long long)schemas::CCSPlayerController::m_pInGameMoneyServices);
+    if (!inventoryServicesPtr) {
+        SasLog::Write("tick #%llu: inventoryServicesPtr is null — wrong field name?", tick);
+        return;
+    }
 
     // Read entity list base
     uintptr_t entityListBase = MemRead<uintptr_t>(
         clientBase + offsets::dwEntityList);
-    if (!entityListBase) return;
+    SasLog::Write("tick #%llu: entityListBase = 0x%llx  (offset 0x%llx)",
+        tick, (unsigned long long)entityListBase,
+        (unsigned long long)offsets::dwEntityList);
+    if (!entityListBase) {
+        SasLog::Write("tick #%llu: entityListBase is null — aborting", tick);
+        return;
+    }
 
     // Walk the loadout slot array (64 slots: pistols, rifles, knives, etc.)
     constexpr int LOADOUT_SLOTS = 64;
     uintptr_t loadoutArray = inventoryServicesPtr +
         schemas::CCSPlayerController_InventoryServices::m_vecNetworkableLoadout;
 
+    SasLog::Write("tick #%llu: loadoutArray = 0x%llx, walking %d slots...",
+        tick, (unsigned long long)loadoutArray, LOADOUT_SLOTS);
+
+    int written = 0;
     for (int i = 0; i < LOADOUT_SLOTS; ++i) {
         uint32_t handle = MemRead<uint32_t>(loadoutArray + i * sizeof(uint32_t));
         if (handle == 0 || handle == 0xFFFFFFFF) continue;
@@ -152,23 +192,18 @@ static void ApplySkins()
         uintptr_t weaponEntity = EntityFromHandle(entityListBase, handle);
         if (!weaponEntity) continue;
 
-        // Navigate to C_EconItemView via C_AttributeContainer.
-        // m_AttributeManager is an *embedded* C_AttributeContainer (not a pointer),
-        // so we add the offset directly — no pointer dereference here.
         uintptr_t attrMgrBase = weaponEntity + schemas::C_EconEntity::m_AttributeManager;
-
-        // m_Item is likewise an embedded C_EconItemView inside C_AttributeContainer.
         uintptr_t itemViewPtr = attrMgrBase + schemas::C_AttributeContainer::m_Item;
 
-        // Write weapon type.
         MemWrite<uint16_t>(
             itemViewPtr + schemas::C_EconItemView::m_iItemDefinitionIndex,
             static_cast<uint16_t>(desiredDefIndex));
-
-        // Write paint kit and wear directly to the fallback fields on C_EconEntity.
         MemWrite<int32_t>(weaponEntity + schemas::C_EconEntity::m_nFallbackPaintKit, paintKitId);
         MemWrite<float>  (weaponEntity + schemas::C_EconEntity::m_flFallbackWear,    wear);
+        ++written;
     }
+
+    SasLog::Write("tick #%llu: done — wrote to %d weapon slot(s)", tick, written);
 }
 
 static void UpdateLoop()
@@ -188,15 +223,19 @@ namespace SovereignHook {
 
 void Install()
 {
+    SasLog::Write("Install(): starting update thread (250ms tick)");
     g_running.store(true);
     g_updateThread = std::thread(UpdateLoop);
+    SasLog::Write("Install(): thread started");
 }
 
 void Uninstall()
 {
+    SasLog::Write("Uninstall(): stopping update thread");
     g_running.store(false);
     if (g_updateThread.joinable())
         g_updateThread.join();
+    SasLog::Write("Uninstall(): thread joined");
 }
 
 } // namespace SovereignHook

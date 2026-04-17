@@ -24,6 +24,7 @@
 #include "shared_skin_state.h"
 #include "skin_loader.h"    // DynamicSkin, LoadSkinsJson, BuildStaticFallback, WearGrade
 #include "inspect_api.h"    // InspectResult, QueryInspectUrl
+#include "curator_log.h"    // CuratorLog::Init, Write, Close
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
@@ -131,6 +132,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
         return 1;
     }
 
+    // Open log as early as possible so every subsequent step is recorded.
+    CuratorLog::Init(GetExeDir());
+    CuratorLog::Write("MuseumCurator starting");
+
     BOOL dark = TRUE;
     DwmSetWindowAttribute(g_hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
 
@@ -138,22 +143,31 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     UpdateWindow(g_hwnd);
 
     // Shared memory for SovereignHook.dll
+    CuratorLog::Write("Creating shared memory: Local\\SkinsAreSillyState");
     g_hSkinShmem = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr,
         PAGE_READWRITE, 0, sizeof(SharedSkinState), SKINSARESILLY_SHMEM_NAME);
-    if (g_hSkinShmem)
+    if (g_hSkinShmem) {
         g_pSkinState = static_cast<SharedSkinState*>(
             MapViewOfFile(g_hSkinShmem, FILE_MAP_WRITE, 0, 0, sizeof(SharedSkinState)));
+        CuratorLog::Write("Shared memory created OK (handle 0x%p)", (void*)g_hSkinShmem);
+    } else {
+        CuratorLog::Write("ERROR: CreateFileMappingW failed (error %lu)", GetLastError());
+    }
 
     // Load skin catalogue (try skins.json first, fall back to static list)
     {
         std::wstring jsonPath = GetExeDir() + L"skins.json";
+        CuratorLog::Write("Looking for skins.json at exe dir...");
         auto loaded = LoadSkinsJson(jsonPath);
         if (!loaded.empty()) {
-            g_skins       = std::move(loaded);
+            g_skins         = std::move(loaded);
             g_skinsFromJson = true;
+            CuratorLog::Write("Loaded %d skins from skins.json", (int)g_skins.size());
         } else {
-            g_skins       = BuildStaticFallback();
+            g_skins         = BuildStaticFallback();
             g_skinsFromJson = false;
+            CuratorLog::Write("skins.json not found or empty — using static fallback (%d skins)",
+                (int)g_skins.size());
         }
     }
 
@@ -499,8 +513,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
         bool canInject = g_disclaimerAccepted && !g_demoMode;
         if (!canInject) ImGui::BeginDisabled();
         if (ImGui::Button("Inject SovereignHook.dll into CS2", {-1.0f, 38.0f})) {
+            CuratorLog::Write("Inject button clicked");
             DWORD pid = FindProcessId(L"cs2.exe");
             if (pid == 0) {
+                CuratorLog::Write("cs2.exe not found in process list");
                 wcscpy_s(g_statusMsg, L"CS2 not found. Launch CS2 with -insecure first.");
             } else {
                 wchar_t exePath[MAX_PATH]{};
@@ -510,11 +526,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
                     wcscpy_s(slash + 1,
                              MAX_PATH - (slash - exePath + 1),
                              L"SovereignHook.dll");
+                CuratorLog::Write("cs2.exe PID = %lu", pid);
+                CuratorLog::Write("DLL path: %ls", exePath);
+                CuratorLog::Write("Calling InjectDll...");
                 std::wstring err = InjectDll(pid, exePath);
                 if (err.empty()) {
+                    CuratorLog::Write("InjectDll returned success — DLL loaded into cs2.exe");
                     wcscpy_s(g_statusMsg,
                         L"Injected. Skin active. Keep CS2 in -insecure mode.");
                 } else {
+                    CuratorLog::Write("InjectDll FAILED: %ls", err.c_str());
                     wcscpy_s(g_statusMsg, (L"Injection failed: " + err).c_str());
                 }
             }
@@ -547,6 +568,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
         g_pSwapChain->Present(1, 0);
     }
 
+    CuratorLog::Write("Main loop exited — shutting down");
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
@@ -554,6 +576,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
 
     if (g_pSkinState) { UnmapViewOfFile(g_pSkinState); g_pSkinState = nullptr; }
     if (g_hSkinShmem) { CloseHandle(g_hSkinShmem);     g_hSkinShmem = nullptr; }
+    CuratorLog::Write("MuseumCurator exiting cleanly");
+    CuratorLog::Close();
 
     DestroyWindow(g_hwnd);
     UnregisterClassW(wc.lpszClassName, hInstance);

@@ -159,8 +159,8 @@ Published hashes for the current `bin/` contents:
 
 | File | SHA-256 |
 |------|---------|
-| `bin/SovereignHook.dll` | `c36810396eba17d09b9df91da85dead0badf6eac416a83172a9e33a9745838de` |
-| `bin/MuseumCurator.exe` | `e212b0598bdf38582eaa0905c08628ea6dc984ac96d9fc2068906eacb49275b1` |
+| `bin/SovereignHook.dll` | `6fa4eabe5add69628296b3d5552fec5cb4a31186fb97892136d757a222eb1729` |
+| `bin/MuseumCurator.exe` | `0e172ce517c6641f3418989f173301da26c10b183f1f6a158551718584fbd31c` |
 
 ```powershell
 Get-FileHash bin\SovereignHook.dll  -Algorithm SHA256
@@ -189,6 +189,18 @@ sha256sum SovereignHook.dll MuseumCurator.exe
 ```
 
 The hashes should match the table above. If they don't, open an issue — either the build is not reproducible (a bug) or something is wrong (a security concern).
+
+---
+
+## Known crash behaviour
+
+If CS2 crashes to desktop immediately after injection (MuseumCurator reports success but the game exits), this is **not** a deliberate action by SAS. The most likely cause is stale memory offsets.
+
+`SovereignHook.dll` navigates weapon entity memory using offset constants from [a2x/cs2-dumper](https://github.com/a2x/cs2-dumper) (`offsets.hpp`, `client_dll.hpp`). These constants change after every CS2 patch. If the offsets are wrong, the hook's memory reads resolve to invalid addresses, and the first `memcpy` write in the update loop causes an access violation that takes down the game process.
+
+**How to fix:** rebuild from source after fetching a fresh set of dumper headers. The CMake `FetchContent` target pins to `GIT_TAG=main`; deleting `build/_deps/cs2_dumper-src` and re-running `cmake ..` will pull the latest output.
+
+The `m_pInGameMoneyServices` field used to resolve the inventory services pointer is also noted in the source as a placeholder — if the field name in the current dumper output has changed, that pointer chain will yield zero and no writes will occur (safe), but with an incorrect non-zero result it can crash.
 
 ---
 

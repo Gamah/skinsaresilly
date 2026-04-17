@@ -326,6 +326,43 @@ static void ApplySkins()
                     tick, (unsigned long long)weaponEntity, defIndex);
         }
 
+        // ---------- Attribute list memory layout dump (first write only) ----------
+        // Both CAttributeList fields (m_AttributeList at 0x208 and
+        // m_NetworkedDynamicAttributes at 0x280 in C_EconItemView) are examined.
+        // We dump 40 bytes raw from the m_Attributes vector inside each one so we
+        // can figure out the C_UtlVectorEmbeddedNetworkVar layout and element stride
+        // before writing to it.
+        if (lastIt == g_lastWritten.end()) {
+            // m_AttributeList (non-networked in name, but is NetworkVarName — may be more stable)
+            {
+                uintptr_t base = itemViewPtr + schemas::C_EconItemView::m_AttributeList;
+                uintptr_t vec  = base + schemas::CAttributeList::m_Attributes;
+                uint64_t w0 = MemRead<uint64_t>(vec + 0x00);
+                uint64_t w1 = MemRead<uint64_t>(vec + 0x08);
+                uint64_t w2 = MemRead<uint64_t>(vec + 0x10);
+                uint64_t w3 = MemRead<uint64_t>(vec + 0x18);
+                uint64_t w4 = MemRead<uint64_t>(vec + 0x20);
+                SasLog::Write("tick #%llu: entity=0x%llX defIdx=%d "
+                              "m_AttributeList vec[0..4]: %016llX %016llX %016llX %016llX %016llX",
+                    tick, (unsigned long long)weaponEntity, defIndex,
+                    w0, w1, w2, w3, w4);
+            }
+            // m_NetworkedDynamicAttributes
+            {
+                uintptr_t base = itemViewPtr + schemas::C_EconItemView::m_NetworkedDynamicAttributes;
+                uintptr_t vec  = base + schemas::CAttributeList::m_Attributes;
+                uint64_t w0 = MemRead<uint64_t>(vec + 0x00);
+                uint64_t w1 = MemRead<uint64_t>(vec + 0x08);
+                uint64_t w2 = MemRead<uint64_t>(vec + 0x10);
+                uint64_t w3 = MemRead<uint64_t>(vec + 0x18);
+                uint64_t w4 = MemRead<uint64_t>(vec + 0x20);
+                SasLog::Write("tick #%llu: entity=0x%llX defIdx=%d "
+                              "m_NetworkedDynAttr vec[0..4]: %016llX %016llX %016llX %016llX %016llX",
+                    tick, (unsigned long long)weaponEntity, defIndex,
+                    w0, w1, w2, w3, w4);
+            }
+        }
+
         // Invalidate the non-networked item ID cache (what the renderer actually reads).
         MemWrite<uint64_t>(itemViewPtr + schemas::C_EconItemView::m_iItemID,     0xFFFFFFFFFFFFFFFFull);
         // Also cover the networked split fields so a re-sync from High+Low still sees invalid.

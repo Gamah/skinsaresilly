@@ -53,14 +53,24 @@ static void MemWrite(uintptr_t addr, T val)
 // An EntityHandle is a 32-bit value: lower 15 bits = entity index,
 // upper bits = serial number. The entity list is split into chunks of 512.
 //
-// Layout (from CS2 reverse engineering, consistent across recent builds):
-//   EntityList base → array of chunk pointers
-//   chunk[i]        → array of entity pointers (stride = 0x78 per slot)
-//   entity ptr      → CEntityInstance* (first field of entity)
+// dwEntityList points to CGameEntitySystem*, which inherits CEntitySystem.
+// CEntitySystem layout (from hl2sdk entity2/entitysystem.h):
+//   +0x00  vtable
+//   +0x08  m_pCurrentManifest (IEntityResourceManifest*, private)
+//   +0x10  m_EntityList (CConcreteEntityList, inline)
+//
+// CConcreteEntityList layout (entity2/concreteentitylist.h):
+//   +0x00  m_pIdentityChunks[64]  — CEntityIdentity* per chunk (512 entries each)
+//
+// So chunk[i] pointer lives at: entityListBase + 0x10 + i * 8
+//
+// Each chunk is an array of CEntityIdentity (stride = 0x78).
+// CEntityIdentity::m_pInstance (CEntityInstance*) is at offset 0x00.
 // ---------------------------------------------------------------------------
-static constexpr uint32_t ENT_ENTRY_MASK  = 0x7FFF;
-static constexpr uint32_t ENT_CHUNK_SIZE  = 512;
-static constexpr uintptr_t ENT_PTR_STRIDE = 0x78;  // bytes per slot in chunk
+static constexpr uint32_t  ENT_ENTRY_MASK  = 0x7FFF;
+static constexpr uint32_t  ENT_CHUNK_SIZE  = 512;
+static constexpr uintptr_t ENT_PTR_STRIDE  = 0x78;   // sizeof(CEntityIdentity)
+static constexpr uintptr_t ENT_LIST_OFFSET = 0x10;   // CEntitySystem::m_EntityList offset
 
 static uintptr_t EntityFromHandle(uintptr_t entityListBase, uint32_t handle)
 {
@@ -70,9 +80,11 @@ static uintptr_t EntityFromHandle(uintptr_t entityListBase, uint32_t handle)
     uint32_t chunk = index / ENT_CHUNK_SIZE;
     uint32_t slot  = index % ENT_CHUNK_SIZE;
 
-    uintptr_t chunkPtr = MemRead<uintptr_t>(entityListBase + (chunk + 1) * 8);
+    // m_pIdentityChunks[chunk] lives at entityListBase + 0x10 + chunk * 8
+    uintptr_t chunkPtr = MemRead<uintptr_t>(entityListBase + ENT_LIST_OFFSET + chunk * 8);
     if (!chunkPtr) return 0;
 
+    // m_pInstance is at offset 0x00 within CEntityIdentity
     return MemRead<uintptr_t>(chunkPtr + slot * ENT_PTR_STRIDE);
 }
 

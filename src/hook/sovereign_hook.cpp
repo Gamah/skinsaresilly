@@ -219,14 +219,16 @@ static void ApplySkins()
     }
     SasLog::Write("tick #%llu: weaponServicesPtr=0x%llX", tick, (unsigned long long)weaponServicesPtr);
 
-    // m_hMyWeapons is C_NetworkUtlVectorBase<CHandle<C_BasePlayerWeapon>> (24 bytes):
-    //   +0x00  T*      data pointer
-    //   +0x08  int32   allocation count
-    //   +0x0C  int32   grow size
-    //   +0x10  int32   element count (m_Size)
-    uintptr_t weaponsBase = weaponServicesPtr + schemas::CPlayer_WeaponServices::m_hMyWeapons;
-    uintptr_t weaponsDataPtr = MemRead<uintptr_t>(weaponsBase + 0x00);
-    int32_t   weaponsCount   = MemRead<int32_t> (weaponsBase + 0x10);
+    // CUtlVector layout (hl2sdk tier1/utlvector.h):
+    //   +0x00  int32   m_Size          — element count  (NOT the data pointer)
+    //   +0x04  int32   padding
+    //   +0x08  T*      m_pMemory       — heap pointer to handle array
+    //   +0x10  int32   m_nAllocationCount
+    // The previous assumption (data pointer first) was wrong; m_Size=3 was
+    // being used as a pointer → crash on the first handle read from address 0x3.
+    uintptr_t weaponsBase    = weaponServicesPtr + schemas::CPlayer_WeaponServices::m_hMyWeapons;
+    int32_t   weaponsCount   = MemRead<int32_t>  (weaponsBase + 0x00);
+    uintptr_t weaponsDataPtr = MemRead<uintptr_t>(weaponsBase + 0x08);
 
     if (!weaponsDataPtr || weaponsCount <= 0 || weaponsCount > 64) {
         if (tick % 20 == 1)

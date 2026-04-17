@@ -54,8 +54,8 @@ Before running anything, verify the hashes match the source you can read:
 
 | File | SHA-256 |
 |------|---------|
-| `bin/SovereignHook.dll` | `6fa4eabe5add69628296b3d5552fec5cb4a31186fb97892136d757a222eb1729` |
-| `bin/MuseumCurator.exe` | `0e172ce517c6641f3418989f173301da26c10b183f1f6a158551718584fbd31c` |
+| `bin/SovereignHook.dll` | `32691febb4e37ea33772a292524ccbe048efbe4a6094c09bfaa7185f67899920` |
+| `bin/MuseumCurator.exe` | `d46d0220aa9957ea0a68078f0214cbcfb6af16c86a48cf85916d31f8e242690f` |
 
 ```powershell
 # PowerShell — verify before running

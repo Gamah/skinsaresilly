@@ -102,6 +102,7 @@ set(HL2SDK_INCLUDE_DIRS
 add_library(SovereignHook SHARED
     src/hook/dllmain.cpp
     src/hook/sovereign_hook.cpp
+    src/hook/sas_log.cpp
 )
 target_include_directories(SovereignHook PRIVATE
     src

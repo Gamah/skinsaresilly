@@ -11,19 +11,16 @@
 
 #include <wchar.h>
 #include <algorithm>
-#include <atomic>
 #include <cctype>
-#include <mutex>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "imgui.h"
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
 #include "shared_skin_state.h"
-#include "skin_loader.h"    // DynamicSkin, LoadSkinsJson, BuildStaticFallback, WearGrade
-#include "inspect_api.h"    // InspectResult, QueryInspectUrl
+#include "skin_loader.h"    // DynamicSkin, LoadSkinsJson, BuildStaticFallback, WearGrade, GetExeDir
+#include "loadout.h"        // Loadout, LoadoutEntry
 #include "curator_log.h"    // CuratorLog::Init, Write, Close
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
@@ -31,16 +28,17 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM,
 // ---------------------------------------------------------------------------
 // Shared memory — IPC to SovereignHook.dll
 // ---------------------------------------------------------------------------
-static HANDLE           g_hSkinShmem = nullptr;
-static SharedSkinState* g_pSkinState = nullptr;
+static HANDLE              g_hLoadoutShmem  = nullptr;
+static SharedLoadoutState* g_pLoadoutState  = nullptr;
+static uint32_t            g_shmemVersion   = 0;
 
 // ---------------------------------------------------------------------------
 // D3D11 globals
 // ---------------------------------------------------------------------------
-static HWND                     g_hwnd                = nullptr;
-static ID3D11Device*            g_pd3dDevice          = nullptr;
-static ID3D11DeviceContext*     g_pd3dContext         = nullptr;
-static IDXGISwapChain*          g_pSwapChain          = nullptr;
+static HWND                     g_hwnd                 = nullptr;
+static ID3D11Device*            g_pd3dDevice           = nullptr;
+static ID3D11DeviceContext*     g_pd3dContext          = nullptr;
+static IDXGISwapChain*          g_pSwapChain           = nullptr;
 static ID3D11RenderTargetView*  g_mainRenderTargetView = nullptr;
 
 static bool CreateDeviceD3D(HWND);
@@ -56,53 +54,84 @@ static bool    g_disclaimerAccepted = false;
 static bool    g_demoMode           = false;
 static wchar_t g_statusMsg[256]     = L"Ready. CS2 must be running with -insecure.";
 
-// Skin catalogue
+// Skin catalogue (loaded from skins.json or static fallback)
 static std::vector<DynamicSkin> g_skins;
 static bool                     g_skinsFromJson = false;
-static int                      g_selectedIdx   = -1;   // -1 = nothing selected
 
-// Filter state
+// Loadout
+static Loadout       g_loadout;
+static std::wstring  g_loadoutPath;
+
+// Weapon display list — one entry per unique weapon derived from the skin catalogue
+struct WeaponInfo {
+    std::string    weaponId;
+    std::string    weaponName;
+    int            weaponDefIndex;
+    WeaponCategory category;
+};
+static std::vector<WeaponInfo> g_weapons;
+
+// Currently selected weapon row in the loadout table (weaponDefIndex, 0 = none)
+static int g_activeWeaponDefIdx = 0;
+
+// Search filter in the skin picker
 static char g_searchBuf[128] = {};
-static int  g_catFilter      = kCatAll;
-
-// Async inspect-link lookup
-static char                  g_inspectBuf[512] = {};
-static std::string           g_inspectStatus;
-static std::atomic<bool>     g_inspectPending{false};
-static std::atomic<bool>     g_inspectResultReady{false};
-static std::mutex            g_inspectMutex;
-static InspectResult         g_inspectResult;
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-static void WriteToSharedMem(int defIdx, int paintKit, float wear) {
-    if (g_pSkinState) {
-        g_pSkinState->weaponDefIndex = defIdx;
-        g_pSkinState->paintKitId     = paintKit;
-        g_pSkinState->wear           = wear;
+
+// Write the full Loadout to shared memory and bump the version counter.
+static void PushLoadoutToSharedMem()
+{
+    if (!g_pLoadoutState) return;
+
+    SharedLoadoutState state{};
+    state.version = ++g_shmemVersion;
+
+    int slot = 0;
+    for (const auto& e : g_loadout.Entries()) {
+        if (slot >= SAS_MAX_LOADOUT_ENTRIES) break;
+        state.slots[slot].weaponDefIndex = e.weaponDefIndex;
+        state.slots[slot].paintKitId     = e.paintKitId;
+        state.slots[slot].wear           = e.wear;
+        ++slot;
     }
+
+    std::memcpy(g_pLoadoutState, &state, sizeof(SharedLoadoutState));
 }
 
-static void ClearSharedMem() {
-    if (g_pSkinState) {
-        g_pSkinState->weaponDefIndex = 0;
-        g_pSkinState->paintKitId     = 0;
-        g_pSkinState->wear           = 0.0f;
-    }
-}
-
-static std::string ToLower(const std::string& s) {
+static std::string ToLower(const std::string& s)
+{
     std::string out = s;
     for (char& c : out) c = (char)tolower((unsigned char)c);
     return out;
 }
 
-// Truncate a float-to-string to N chars (avoids exposing all the noise digits)
-static std::string FloatStr(float v, int chars = 6) {
-    std::string s = std::to_string(v);
-    if ((int)s.size() > chars) s = s.substr(0, chars);
-    return s;
+// Build the canonical weapon list from the skin catalogue.
+// Deduplicates by weaponDefIndex; sorts by category then name.
+static void BuildWeaponList()
+{
+    g_weapons.clear();
+    for (const auto& skin : g_skins) {
+        bool found = false;
+        for (const auto& w : g_weapons) {
+            if (w.weaponDefIndex == skin.weaponDefIndex) { found = true; break; }
+        }
+        if (!found) {
+            WeaponInfo wi;
+            wi.weaponId       = skin.weaponId;
+            wi.weaponName     = skin.weaponName;
+            wi.weaponDefIndex = skin.weaponDefIndex;
+            wi.category       = skin.category;
+            g_weapons.push_back(std::move(wi));
+        }
+    }
+    std::sort(g_weapons.begin(), g_weapons.end(),
+        [](const WeaponInfo& a, const WeaponInfo& b) {
+            if (a.category != b.category) return (int)a.category < (int)b.category;
+            return a.weaponName < b.weaponName;
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -123,7 +152,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
         L"SkinsAreSilly \u2014 Museum Curator",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         CW_USEDEFAULT, CW_USEDEFAULT,
-        760, 600,
+        820, 620,
         nullptr, nullptr, hInstance, nullptr);
 
     if (!g_hwnd || !CreateDeviceD3D(g_hwnd)) {
@@ -132,7 +161,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
         return 1;
     }
 
-    // Open log as early as possible so every subsequent step is recorded.
     CuratorLog::Init(GetExeDir());
     CuratorLog::Write("MuseumCurator starting");
 
@@ -144,12 +172,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
 
     // Shared memory for SovereignHook.dll
     CuratorLog::Write("Creating shared memory: Local\\SkinsAreSillyState");
-    g_hSkinShmem = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr,
-        PAGE_READWRITE, 0, sizeof(SharedSkinState), SKINSARESILLY_SHMEM_NAME);
-    if (g_hSkinShmem) {
-        g_pSkinState = static_cast<SharedSkinState*>(
-            MapViewOfFile(g_hSkinShmem, FILE_MAP_WRITE, 0, 0, sizeof(SharedSkinState)));
-        CuratorLog::Write("Shared memory created OK (handle 0x%p)", (void*)g_hSkinShmem);
+    g_hLoadoutShmem = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr,
+        PAGE_READWRITE, 0, sizeof(SharedLoadoutState), SKINSARESILLY_SHMEM_NAME);
+    if (g_hLoadoutShmem) {
+        g_pLoadoutState = static_cast<SharedLoadoutState*>(
+            MapViewOfFile(g_hLoadoutShmem, FILE_MAP_WRITE, 0, 0, sizeof(SharedLoadoutState)));
+        CuratorLog::Write("Shared memory created OK (handle 0x%p)", (void*)g_hLoadoutShmem);
     } else {
         CuratorLog::Write("ERROR: CreateFileMappingW failed (error %lu)", GetLastError());
     }
@@ -157,7 +185,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     // Load skin catalogue (try skins.json first, fall back to static list)
     {
         std::wstring jsonPath = GetExeDir() + L"skins.json";
-        CuratorLog::Write("Looking for skins.json at exe dir...");
         auto loaded = LoadSkinsJson(jsonPath);
         if (!loaded.empty()) {
             g_skins         = std::move(loaded);
@@ -166,10 +193,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
         } else {
             g_skins         = BuildStaticFallback();
             g_skinsFromJson = false;
-            CuratorLog::Write("skins.json not found or empty — using static fallback (%d skins)",
-                (int)g_skins.size());
+            CuratorLog::Write("skins.json not found — using static fallback (%d skins)", (int)g_skins.size());
         }
     }
+
+    BuildWeaponList();
+
+    // Load saved loadout and push it to shared memory immediately so any
+    // already-running hook picks up the previous session's assignments.
+    g_loadoutPath = GetExeDir() + L"loadout.json";
+    g_loadout.Load(g_loadoutPath);
+    PushLoadoutToSharedMem();
+    CuratorLog::Write("Loadout loaded: %d weapon(s) assigned", (int)g_loadout.Entries().size());
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -177,15 +212,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     io.IniFilename = nullptr;
 
     ImGui::StyleColorsDark();
-    ImGuiStyle& style           = ImGui::GetStyle();
-    style.WindowRounding        = 4.0f;
-    style.FrameRounding         = 3.0f;
-    style.ScrollbarRounding     = 3.0f;
-    style.TabRounding           = 3.0f;
-    style.ItemSpacing           = {8.0f, 5.0f};
-    style.Colors[ImGuiCol_Tab]              = ImVec4(0.18f, 0.18f, 0.22f, 1.0f);
-    style.Colors[ImGuiCol_TabSelected]      = ImVec4(0.28f, 0.48f, 0.72f, 1.0f);
-    style.Colors[ImGuiCol_TabHovered]       = ImVec4(0.35f, 0.55f, 0.80f, 1.0f);
+    ImGuiStyle& style       = ImGui::GetStyle();
+    style.WindowRounding    = 4.0f;
+    style.FrameRounding     = 3.0f;
+    style.ScrollbarRounding = 3.0f;
+    style.TabRounding       = 3.0f;
+    style.ItemSpacing       = {8.0f, 5.0f};
+    style.Colors[ImGuiCol_Tab]         = ImVec4(0.18f, 0.18f, 0.22f, 1.0f);
+    style.Colors[ImGuiCol_TabSelected] = ImVec4(0.28f, 0.48f, 0.72f, 1.0f);
+    style.Colors[ImGuiCol_TabHovered]  = ImVec4(0.35f, 0.55f, 0.80f, 1.0f);
 
     ImGui_ImplWin32_Init(g_hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dContext);
@@ -202,47 +237,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
         }
         if (done) break;
 
-        // ------------------------------------------------------------------
-        // Consume async inspect result (pre-frame, outside ImGui)
-        // ------------------------------------------------------------------
-        if (g_inspectResultReady.exchange(false)) {
-            std::lock_guard<std::mutex> lock(g_inspectMutex);
-            const InspectResult& r = g_inspectResult;
-            if (r.ok) {
-                // Try to find a matching skin in the catalogue and select it
-                int found = -1;
-                for (int i = 0; i < (int)g_skins.size(); ++i) {
-                    if (g_skins[i].weaponDefIndex == r.defIndex &&
-                        g_skins[i].paintKitId     == r.paintIndex) {
-                        found = i; break;
-                    }
-                }
-                float clampedWear = r.floatValue;
-                if (found >= 0) {
-                    auto& s = g_skins[found];
-                    clampedWear    = std::clamp(r.floatValue, s.minWear, s.maxWear);
-                    s.wear         = clampedWear;
-                    g_selectedIdx  = found;
-                    g_inspectStatus = "Applied: " + r.fullName
-                        + "  [" + r.wearName + " " + FloatStr(clampedWear) + "]";
-                } else {
-                    // Not in the catalogue — write directly to shared mem
-                    g_inspectStatus = "Applied (not in catalogue): " + r.fullName
-                        + "  [" + r.wearName + " " + FloatStr(r.floatValue) + "]";
-                }
-                WriteToSharedMem(r.defIndex, r.paintIndex, clampedWear);
-            } else {
-                g_inspectStatus = "Error: " + r.error;
-            }
-        }
-
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
 
-        // ------------------------------------------------------------------
+        // ----------------------------------------------------------------------
         // Disclaimer modal
-        // ------------------------------------------------------------------
+        // ----------------------------------------------------------------------
         if (!g_disclaimerAccepted) {
             ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(),
                                     ImGuiCond_Always, {0.5f, 0.5f});
@@ -270,7 +271,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
                 ImGui::Spacing();
                 ImGui::Separator();
                 ImGui::Spacing();
-                float btnW = 200.0f;
+                float btnW  = 200.0f;
                 float indent = (ImGui::GetContentRegionAvail().x - btnW) * 0.5f;
                 ImGui::SetCursorPosX(ImGui::GetCursorPosX() + indent);
                 if (ImGui::Button("I Understand \xe2\x80\x94 Proceed", {btnW, 0})) {
@@ -281,9 +282,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
             }
         }
 
-        // ------------------------------------------------------------------
+        // ----------------------------------------------------------------------
         // Main window (fills entire client area)
-        // ------------------------------------------------------------------
+        // ----------------------------------------------------------------------
         ImGui::SetNextWindowPos({0, 0}, ImGuiCond_Always);
         ImGui::SetNextWindowSize(io.DisplaySize, ImGuiCond_Always);
         ImGui::Begin("##main", nullptr,
@@ -296,227 +297,269 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
         ImGui::Text("SkinsAreSilly \xe2\x80\x94 Museum Curator");
         ImGui::PopStyleColor();
         ImGui::SameLine();
-        ImGui::TextDisabled("  v0.1.0-alpha  |  GPL-3.0  |  -insecure mode only");
+        ImGui::TextDisabled("  v0.2.0-alpha  |  GPL-3.0  |  -insecure mode only");
         ImGui::Separator();
         ImGui::Spacing();
 
         // ---- Demo mode ----
         ImGui::Checkbox("Demo Mode  (no injection \xe2\x80\x94 UI preview only)", &g_demoMode);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip(
-                "When enabled, skin selection updates the preview without injecting.\n"
-                "Verify the UI works before running against a live game.");
         if (!g_skinsFromJson) {
             ImGui::SameLine(0, 16.0f);
             ImGui::TextDisabled("(static catalogue \xe2\x80\x94 put skins.json beside the exe for all skins)");
         }
         ImGui::Spacing();
 
-        // ==================================================================
-        // SKIN SELECTOR
-        // ==================================================================
+        // ====================================================================
+        // Two-column layout: left = loadout table, right = skin picker
+        // ====================================================================
+        float totalW   = ImGui::GetContentRegionAvail().x;
+        float leftW    = totalW * 0.42f;
+        float rightW   = totalW - leftW - style.ItemSpacing.x;
+        float bottomH  = 60.0f; // space below columns for inject button + status
+        float colH     = ImGui::GetContentRegionAvail().y - bottomH;
+
+        // ----------------------------------------------------------------
+        // LEFT COLUMN — Loadout table
+        // ----------------------------------------------------------------
+        ImGui::BeginChild("##left", {leftW, colH}, false);
+
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.65f, 0.85f, 1.0f, 1.0f));
-        ImGui::TextUnformatted("SKIN SELECTOR");
+        ImGui::TextUnformatted("LOADOUT");
         ImGui::PopStyleColor();
         ImGui::Spacing();
 
-        // Category tabs — ImGui owns the selection; we mirror it into g_catFilter
-        static const char* kCatLabels[kCatCount] = {
-            "All", "Rifles", "Pistols", "SMGs", "Heavy", "Knives"
-        };
-        if (ImGui::BeginTabBar("##cats")) {
-            for (int ci = 0; ci < kCatCount; ++ci) {
-                if (ImGui::BeginTabItem(kCatLabels[ci])) {
-                    g_catFilter = ci;
-                    ImGui::EndTabItem();
-                }
-            }
-            ImGui::EndTabBar();
-        }
+        // Enumerate assigned count
+        int assignedCount = (int)g_loadout.Entries().size();
+        if (assignedCount == 0)
+            ImGui::TextDisabled("No skins assigned yet. Pick a weapon below.");
+        else
+            ImGui::TextDisabled("%d skin(s) assigned  \xe2\x80\x94  auto-applied in-game", assignedCount);
+        ImGui::Spacing();
 
-        // Search box
-        ImGui::SetNextItemWidth(-1.0f);
-        ImGui::InputTextWithHint("##search", "Search skins...",
-                                 g_searchBuf, sizeof(g_searchBuf));
-
-        // Build filtered index list
-        std::string searchLower = ToLower(g_searchBuf);
-        std::vector<int> filtered;
-        filtered.reserve(g_skins.size());
-        for (int i = 0; i < (int)g_skins.size(); ++i) {
-            const auto& s = g_skins[i];
-            if (g_catFilter != kCatAll && (int)s.category != g_catFilter) continue;
-            if (!searchLower.empty()) {
-                if (ToLower(s.name).find(searchLower) == std::string::npos) continue;
-            }
-            filtered.push_back(i);
-        }
-
-        // Skin list height: leave fixed space below for the selected-skin panel,
-        // inspect section, inject button, and status bar
-        const float kBelowList = 215.0f;
-        float listH = std::max(80.0f,
-            ImGui::GetContentRegionAvail().y - kBelowList);
-
-        // Table-based skin list with per-row rarity colour swatch
-        ImGuiTableFlags tableFlags =
+        ImGuiTableFlags tflags =
             ImGuiTableFlags_RowBg        |
             ImGuiTableFlags_ScrollY      |
             ImGuiTableFlags_BordersOuter |
-            ImGuiTableFlags_SizingStretchSame;
+            ImGuiTableFlags_SizingStretchProp;
 
-        if (ImGui::BeginTable("##skinTable", 3, tableFlags, {-1.0f, listH})) {
-            ImGui::TableSetupColumn("##col_c", ImGuiTableColumnFlags_WidthFixed,   12.0f);
-            ImGui::TableSetupColumn("##col_n", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn("##col_g", ImGuiTableColumnFlags_WidthFixed,   26.0f);
+        float tableH = colH - 72.0f;
+        if (ImGui::BeginTable("##loadout", 3, tflags, {-1.0f, tableH})) {
+            ImGui::TableSetupColumn("Weapon",       ImGuiTableColumnFlags_WidthStretch, 0.30f);
+            ImGui::TableSetupColumn("Skin",         ImGuiTableColumnFlags_WidthStretch, 0.60f);
+            ImGui::TableSetupColumn("##clr",        ImGuiTableColumnFlags_WidthFixed,   22.0f);
+            ImGui::TableHeadersRow();
 
-            if (filtered.empty()) {
-                ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(1);
-                ImGui::TextDisabled("No skins match the current filter.");
-            }
-
-            for (int idx : filtered) {
-                auto& s = g_skins[idx];
-                bool  isSelected = (g_selectedIdx == idx);
+            for (const auto& wi : g_weapons) {
+                const LoadoutEntry* assigned = g_loadout.Get(wi.weaponDefIndex);
+                bool isActive = (g_activeWeaponDefIdx == wi.weaponDefIndex);
 
                 ImGui::TableNextRow();
                 ImGui::TableSetColumnIndex(0);
 
-                // Full-row selectable in col 0, spanning all columns.
-                // The rarity swatch is painted overtop via DrawList (purely visual).
-                ImGui::PushID(idx);
-                bool clicked = ImGui::Selectable("##sel", isSelected,
-                    ImGuiSelectableFlags_SpanAllColumns |
-                    ImGuiSelectableFlags_AllowOverlap,
-                    {0.0f, 0.0f});
-                if (clicked) {
-                    if (!isSelected) {
-                        g_selectedIdx = idx;
-                        WriteToSharedMem(s.weaponDefIndex, s.paintKitId, s.wear);
-                    } else {
-                        g_selectedIdx = -1;
-                        ClearSharedMem();
-                    }
-                }
+                // Full-row selectable
+                ImGui::PushID(wi.weaponDefIndex);
+                bool clicked = ImGui::Selectable(wi.weaponName.c_str(), isActive,
+                    ImGuiSelectableFlags_SpanAllColumns, {0.0f, 0.0f});
+                if (clicked)
+                    g_activeWeaponDefIdx = isActive ? 0 : wi.weaponDefIndex;
                 ImGui::PopID();
 
-                // Rarity swatch — drawn over the selectable in col 0
-                {
-                    float lh = ImGui::GetTextLineHeight();
-                    ImVec2 rMin = ImGui::GetItemRectMin();
-                    ImGui::GetWindowDrawList()->AddRectFilled(
-                        {rMin.x + 1.0f, rMin.y + 2.0f},
-                        {rMin.x + 9.0f, rMin.y + lh - 1.0f},
-                        ImGui::ColorConvertFloat4ToU32(s.rarityColor), 1.5f);
+                // Skin name column
+                ImGui::TableSetColumnIndex(1);
+                if (assigned) {
+                    ImGui::TextUnformatted(assigned->skinName.c_str());
+                } else {
+                    ImGui::TextDisabled("\xe2\x80\x94");
                 }
 
-                // Col 1 — skin name
-                ImGui::TableSetColumnIndex(1);
-                ImGui::TextUnformatted(s.name.c_str());
-
-                // Col 2 — wear grade
+                // Clear button column
                 ImGui::TableSetColumnIndex(2);
-                ImGui::PushStyleColor(ImGuiCol_Text, {0.50f, 0.50f, 0.50f, 1.0f});
-                ImGui::TextUnformatted(WearGrade(s.wear));
-                ImGui::PopStyleColor();
+                if (assigned) {
+                    ImGui::PushID(wi.weaponDefIndex + 10000);
+                    if (ImGui::SmallButton("X")) {
+                        g_loadout.Clear(wi.weaponDefIndex);
+                        g_loadout.Save(g_loadoutPath);
+                        PushLoadoutToSharedMem();
+                        CuratorLog::Write("Cleared skin for defIndex=%d", wi.weaponDefIndex);
+                        if (g_activeWeaponDefIdx == wi.weaponDefIndex)
+                            g_activeWeaponDefIdx = 0;
+                    }
+                    ImGui::PopID();
+                }
             }
-
             ImGui::EndTable();
         }
 
-        // ------------------------------------------------------------------
-        // Selected skin panel — wear slider
-        // ------------------------------------------------------------------
-        ImGui::Spacing();
-        if (g_selectedIdx >= 0 && g_selectedIdx < (int)g_skins.size()) {
-            auto& s = g_skins[g_selectedIdx];
+        ImGui::EndChild(); // ##left
 
-            ImGui::PushStyleColor(ImGuiCol_Text, s.rarityColor);
-            ImGui::Text("[%s]", s.rarityName.empty() ? "?" : s.rarityName.c_str());
-            ImGui::PopStyleColor();
-            ImGui::SameLine(0, 6.0f);
-            ImGui::TextUnformatted(s.name.c_str());
+        // ----------------------------------------------------------------
+        // RIGHT COLUMN — Skin picker (filtered to active weapon)
+        // ----------------------------------------------------------------
+        ImGui::SameLine();
+        ImGui::BeginChild("##right", {rightW, colH}, false);
 
-            ImGui::SetNextItemWidth(260.0f);
-            bool changed = ImGui::SliderFloat("##wear", &s.wear,
-                                              s.minWear, s.maxWear, "Wear: %.4f");
-            ImGui::SameLine(0, 10.0f);
-            ImGui::TextDisabled("[%s]  min %.2f  max %.2f",
-                WearGrade(s.wear), s.minWear, s.maxWear);
-
-            if (changed)
-                WriteToSharedMem(s.weaponDefIndex, s.paintKitId, s.wear);
-        } else {
-            ImGui::TextDisabled("Click a skin above to select and apply it.");
-            ImGui::Dummy({0, ImGui::GetTextLineHeight()});
-        }
-
-        ImGui::Spacing();
-        ImGui::Separator();
-        ImGui::Spacing();
-
-        // ==================================================================
-        // INSPECT LINK IMPORT
-        // ==================================================================
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.65f, 0.85f, 1.0f, 1.0f));
-        ImGui::TextUnformatted("IMPORT FROM INSPECT LINK");
+        if (g_activeWeaponDefIdx == 0) {
+            ImGui::TextUnformatted("SKIN PICKER");
+        } else {
+            // Find weapon name for header
+            const char* wname = "SKIN PICKER";
+            for (const auto& wi : g_weapons)
+                if (wi.weaponDefIndex == g_activeWeaponDefIdx) { wname = wi.weaponName.c_str(); break; }
+            ImGui::Text("SKIN PICKER  \xe2\x80\x94  %s", wname);
+        }
         ImGui::PopStyleColor();
         ImGui::Spacing();
 
-        bool pending = g_inspectPending.load();
-        if (pending) ImGui::BeginDisabled();
+        if (g_activeWeaponDefIdx == 0) {
+            ImGui::TextDisabled("Click a weapon row on the left to pick a skin for it.");
+        } else {
+            // Search box
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::InputTextWithHint("##search", "Search...", g_searchBuf, sizeof(g_searchBuf));
 
-        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 72.0f);
-        ImGui::InputTextWithHint("##iurl",
-            "steam://rungame/730/.../+csgo_econ_action_preview ...",
-            g_inspectBuf, sizeof(g_inspectBuf));
-        ImGui::SameLine();
+            // Build filtered skin list for this weapon
+            std::string searchLower = ToLower(g_searchBuf);
+            std::vector<int> filtered;
+            filtered.reserve(64);
+            for (int i = 0; i < (int)g_skins.size(); ++i) {
+                const auto& s = g_skins[i];
+                if (s.weaponDefIndex != g_activeWeaponDefIdx) continue;
+                if (!searchLower.empty() &&
+                    ToLower(s.name).find(searchLower) == std::string::npos) continue;
+                filtered.push_back(i);
+            }
 
-        const char* applyLabel = pending ? "Wait..." : "Apply";
-        if (ImGui::Button(applyLabel, {-1.0f, 0}) && !pending) {
-            std::string url = g_inspectBuf;
-            if (!url.empty()) {
-                g_inspectStatus  = "Querying CSGOFloat API...";
-                g_inspectPending = true;
-                std::thread([url]() {
-                    InspectResult result = QueryInspectUrl(url);
-                    {
-                        std::lock_guard<std::mutex> lock(g_inspectMutex);
-                        g_inspectResult = result;
+            // Find currently assigned skin index for this weapon
+            const LoadoutEntry* curAssigned = g_loadout.Get(g_activeWeaponDefIdx);
+            int curPaintKit = curAssigned ? curAssigned->paintKitId : -1;
+
+            // Skin list — reserve space for wear slider below
+            float skinListH = colH - 120.0f;
+            ImGuiTableFlags sf =
+                ImGuiTableFlags_RowBg        |
+                ImGuiTableFlags_ScrollY      |
+                ImGuiTableFlags_BordersOuter |
+                ImGuiTableFlags_SizingStretchSame;
+
+            if (ImGui::BeginTable("##skins", 3, sf, {-1.0f, skinListH})) {
+                ImGui::TableSetupColumn("##c", ImGuiTableColumnFlags_WidthFixed,   12.0f);
+                ImGui::TableSetupColumn("##n", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("##g", ImGuiTableColumnFlags_WidthFixed,   26.0f);
+
+                if (filtered.empty()) {
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::TextDisabled("No skins found.");
+                }
+
+                for (int idx : filtered) {
+                    auto& s = g_skins[idx];
+                    bool isCurrent = (s.paintKitId == curPaintKit);
+
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+
+                    ImGui::PushID(idx);
+                    bool clicked = ImGui::Selectable("##sel", isCurrent,
+                        ImGuiSelectableFlags_SpanAllColumns |
+                        ImGuiSelectableFlags_AllowOverlap,
+                        {0.0f, 0.0f});
+                    if (clicked) {
+                        if (!isCurrent) {
+                            // Assign this skin to the active weapon
+                            LoadoutEntry e;
+                            e.weaponId       = s.weaponId;
+                            e.weaponName     = s.weaponName;
+                            e.weaponDefIndex = s.weaponDefIndex;
+                            e.skinName       = s.name;
+                            e.paintKitId     = s.paintKitId;
+                            e.wear           = s.wear;
+                            g_loadout.Set(e);
+                            g_loadout.Save(g_loadoutPath);
+                            PushLoadoutToSharedMem();
+                            CuratorLog::Write("Assigned defIdx=%d paintKit=%d wear=%.4f",
+                                e.weaponDefIndex, e.paintKitId, e.wear);
+                        } else {
+                            // Deselect — clear this weapon's assignment
+                            g_loadout.Clear(g_activeWeaponDefIdx);
+                            g_loadout.Save(g_loadoutPath);
+                            PushLoadoutToSharedMem();
+                            CuratorLog::Write("Deselected defIdx=%d", g_activeWeaponDefIdx);
+                        }
                     }
-                    g_inspectResultReady.store(true);
-                    g_inspectPending.store(false);
-                }).detach();
+                    ImGui::PopID();
+
+                    // Rarity swatch
+                    {
+                        float lh = ImGui::GetTextLineHeight();
+                        ImVec2 rMin = ImGui::GetItemRectMin();
+                        ImGui::GetWindowDrawList()->AddRectFilled(
+                            {rMin.x + 1.0f, rMin.y + 2.0f},
+                            {rMin.x + 9.0f, rMin.y + lh - 1.0f},
+                            ImGui::ColorConvertFloat4ToU32(s.rarityColor), 1.5f);
+                    }
+
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::TextUnformatted(s.name.c_str());
+
+                    ImGui::TableSetColumnIndex(2);
+                    ImGui::PushStyleColor(ImGuiCol_Text, {0.50f, 0.50f, 0.50f, 1.0f});
+                    ImGui::TextUnformatted(WearGrade(s.wear));
+                    ImGui::PopStyleColor();
+                }
+                ImGui::EndTable();
+            }
+
+            // Wear slider — only when a skin is assigned for this weapon
+            ImGui::Spacing();
+            const LoadoutEntry* cur = g_loadout.Get(g_activeWeaponDefIdx);
+            if (cur) {
+                // Find the DynamicSkin for min/max wear bounds
+                float minWear = 0.0f, maxWear = 1.0f;
+                float wearVal = cur->wear;
+                for (const auto& s : g_skins) {
+                    if (s.weaponDefIndex == cur->weaponDefIndex && s.paintKitId == cur->paintKitId) {
+                        minWear = s.minWear;
+                        maxWear = s.maxWear;
+                        break;
+                    }
+                }
+
+                ImGui::SetNextItemWidth(-100.0f);
+                bool changed = ImGui::SliderFloat("##wear", &wearVal, minWear, maxWear, "Wear: %.4f");
+                ImGui::SameLine(0, 8.0f);
+                ImGui::TextDisabled("[%s]", WearGrade(wearVal));
+
+                if (changed) {
+                    // Update the loadout entry's wear and push
+                    LoadoutEntry updated = *cur;
+                    updated.wear = wearVal;
+                    g_loadout.Set(updated);
+                    g_loadout.Save(g_loadoutPath);
+                    PushLoadoutToSharedMem();
+                }
+            } else {
+                ImGui::TextDisabled("Select a skin above to set its wear.");
             }
         }
 
-        if (pending) ImGui::EndDisabled();
+        ImGui::EndChild(); // ##right
 
-        if (!g_inspectStatus.empty()) {
-            bool isErr = g_inspectStatus.find("Error") != std::string::npos;
-            ImVec4 col = pending  ? ImVec4(0.9f, 0.9f, 0.4f, 1.0f)
-                       : isErr    ? ImVec4(1.0f, 0.4f, 0.4f, 1.0f)
-                       :            ImVec4(0.4f, 0.9f, 0.4f, 1.0f);
-            ImGui::PushStyleColor(ImGuiCol_Text, col);
-            ImGui::TextWrapped("%s", g_inspectStatus.c_str());
-            ImGui::PopStyleColor();
-        }
-
+        // ====================================================================
+        // Inject button + status bar (below the two columns)
+        // ====================================================================
         ImGui::Spacing();
         ImGui::Separator();
         ImGui::Spacing();
 
-        // ==================================================================
-        // INJECT BUTTON
-        // ==================================================================
         bool canInject = g_disclaimerAccepted && !g_demoMode;
         if (!canInject) ImGui::BeginDisabled();
-        if (ImGui::Button("Inject SovereignHook.dll into CS2", {-1.0f, 38.0f})) {
+        if (ImGui::Button("Inject SovereignHook.dll into CS2", {-1.0f, 28.0f})) {
             CuratorLog::Write("Inject button clicked");
             DWORD pid = FindProcessId(L"cs2.exe");
             if (pid == 0) {
-                CuratorLog::Write("cs2.exe not found in process list");
+                CuratorLog::Write("cs2.exe not found");
                 wcscpy_s(g_statusMsg, L"CS2 not found. Launch CS2 with -insecure first.");
             } else {
                 wchar_t exePath[MAX_PATH]{};
@@ -526,34 +569,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
                     wcscpy_s(slash + 1,
                              MAX_PATH - (slash - exePath + 1),
                              L"SovereignHook.dll");
-                CuratorLog::Write("cs2.exe PID = %lu", pid);
-                CuratorLog::Write("DLL path: %ls", exePath);
-                CuratorLog::Write("Calling InjectDll...");
+                CuratorLog::Write("cs2.exe PID = %lu, DLL: %ls", pid, exePath);
                 std::wstring err = InjectDll(pid, exePath);
                 if (err.empty()) {
-                    CuratorLog::Write("InjectDll returned success — DLL loaded into cs2.exe");
-                    wcscpy_s(g_statusMsg,
-                        L"Injected. Skin active. Keep CS2 in -insecure mode.");
+                    wcscpy_s(g_statusMsg, L"Injected. Skins active. Keep CS2 in -insecure mode.");
                 } else {
-                    CuratorLog::Write("InjectDll FAILED: %ls", err.c_str());
                     wcscpy_s(g_statusMsg, (L"Injection failed: " + err).c_str());
                 }
+                CuratorLog::Write("InjectDll result: %ls", err.empty() ? L"OK" : err.c_str());
             }
         }
         if (!canInject) ImGui::EndDisabled();
+
         if (g_demoMode)
             ImGui::TextDisabled("Demo Mode active \xe2\x80\x94 injection disabled.");
 
-        ImGui::Spacing();
-        ImGui::Separator();
-        ImGui::Spacing();
-
-        // Status bar
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.9f, 0.6f, 1.0f));
         ImGui::TextWrapped("%ls", g_statusMsg);
         ImGui::PopStyleColor();
-        ImGui::Spacing();
-        ImGui::TextDisabled("Find this useful? buymeacoffee.com/Gamah");
 
         ImGui::End();
 
@@ -574,8 +607,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     ImGui::DestroyContext();
     CleanupDeviceD3D();
 
-    if (g_pSkinState) { UnmapViewOfFile(g_pSkinState); g_pSkinState = nullptr; }
-    if (g_hSkinShmem) { CloseHandle(g_hSkinShmem);     g_hSkinShmem = nullptr; }
+    if (g_pLoadoutState) { UnmapViewOfFile(g_pLoadoutState); g_pLoadoutState = nullptr; }
+    if (g_hLoadoutShmem) { CloseHandle(g_hLoadoutShmem);     g_hLoadoutShmem = nullptr; }
     CuratorLog::Write("MuseumCurator exiting cleanly");
     CuratorLog::Close();
 
@@ -585,7 +618,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
 }
 
 // ---------------------------------------------------------------------------
-// D3D11 helpers (unchanged from original)
+// D3D11 helpers
 // ---------------------------------------------------------------------------
 static bool CreateDeviceD3D(HWND hwnd)
 {

@@ -9,6 +9,7 @@
 #include <atomic>
 #include <thread>
 #include <chrono>
+#include <unordered_map>
 
 // ---------------------------------------------------------------------------
 // cs2-dumper generated headers (fetched at build time from a2x/cs2-dumper)
@@ -28,7 +29,9 @@ namespace schemas  = cs2_dumper::schemas::client_dll;
 namespace offsets  = cs2_dumper::offsets::client_dll;
 
 // ---------------------------------------------------------------------------
-// Memory helpers
+// Memory helpers — bare memcpy inside the game process (no SEH guard).
+// A bad address will crash the game process, not just this thread.
+// Always validate pointers before calling these.
 // ---------------------------------------------------------------------------
 template<typename T>
 static T MemRead(uintptr_t addr)
@@ -78,33 +81,36 @@ static uintptr_t EntityFromHandle(uintptr_t entityListBase, uint32_t handle)
 // ---------------------------------------------------------------------------
 namespace {
 
-std::atomic<bool>    g_running{false};
-std::thread          g_updateThread;
+std::atomic<bool>     g_running{false};
+std::thread           g_updateThread;
 std::atomic<uint64_t> g_tickCount{0};
 
 // ---------------------------------------------------------------------------
-// ApplySkins — reads the current skin selection from shared memory (written by
+// ApplySkins — reads the full per-weapon loadout from shared memory (written by
 // MuseumCurator.exe), then walks the local player's weapon loadout and writes:
 //
-//   C_EconItemView::m_iItemDefinitionIndex  — weapon type (AK-47 = 7, AWP = 9…)
-//   C_EconEntity::m_nFallbackPaintKit       — paint kit ID (Dragon Lore = 344…)
-//   C_EconEntity::m_flFallbackWear          — wear float [0.0, 1.0]
+//   C_EconEntity::m_nFallbackPaintKit  — paint kit ID (Dragon Lore = 344…)
+//   C_EconEntity::m_flFallbackWear     — wear float [0.0, 1.0]
 //
-// The fallback fields exist precisely for this use-case and are the simplest
-// reliable path; no attribute array traversal required.
+// The fallback fields exist precisely for this use-case; no attribute array
+// traversal required. We do NOT write m_iItemDefinitionIndex — the game engine
+// already has the correct type from its own state, and overwriting it corrupts
+// the entity.
 //
 // Navigation chain (offsets from cs2-dumper client_dll.hpp):
 //   client.dll base + dwLocalPlayerController → CCSPlayerController*
-//     → m_pInGameMoneyServices → CCSPlayerController_InventoryServices*
+//     → m_pInventoryServices → CCSPlayerController_InventoryServices*
 //       → m_vecNetworkableLoadout[64] → entity handles
 //         → weapon entity
 //           → m_AttributeManager → C_AttributeContainer → m_Item → C_EconItemView
+//               (read m_iItemDefinitionIndex to identify weapon type)
+//           → m_nFallbackPaintKit, m_flFallbackWear  (write these)
 // ---------------------------------------------------------------------------
 static void ApplySkins()
 {
     uint64_t tick = ++g_tickCount;
 
-    // Read skin selection from shared memory written by MuseumCurator.exe.
+    // Read the full loadout from shared memory written by MuseumCurator.exe.
     HANDLE hMap = OpenFileMappingW(FILE_MAP_READ, FALSE, SKINSARESILLY_SHMEM_NAME);
     if (!hMap) {
         if (tick == 1)
@@ -112,65 +118,66 @@ static void ApplySkins()
         return;
     }
 
-    const auto* state = static_cast<const SharedSkinState*>(
-        MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, sizeof(SharedSkinState)));
-    if (!state || state->weaponDefIndex == 0) {
+    const auto* state = static_cast<const SharedLoadoutState*>(
+        MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, sizeof(SharedLoadoutState)));
+    if (!state || state->version == 0) {
         if (state) UnmapViewOfFile(state);
         CloseHandle(hMap);
         if (tick == 1)
-            SasLog::Write("tick #%llu: shmem mapped but weaponDefIndex==0 — select a skin first", tick);
+            SasLog::Write("tick #%llu: shmem mapped but version==0 — loadout is empty (select skins first)", tick);
         return;
     }
 
-    int   desiredDefIndex = state->weaponDefIndex;
-    int   paintKitId      = state->paintKitId;
-    float wear            = state->wear;
+    // Build a quick defIndex → slot lookup from the sparse slots array.
+    std::unordered_map<int, LoadoutSlot> skinMap;
+    for (int i = 0; i < SAS_MAX_LOADOUT_ENTRIES; ++i) {
+        const auto& s = state->slots[i];
+        if (s.weaponDefIndex != 0)
+            skinMap[s.weaponDefIndex] = s;
+    }
+    uint32_t loadoutVersion = state->version;
     UnmapViewOfFile(state);
     CloseHandle(hMap);
 
-    SasLog::Write("tick #%llu: defIdx=%d paintKit=%d wear=%.4f",
-        tick, desiredDefIndex, paintKitId, wear);
+    if (skinMap.empty()) {
+        if (tick == 1)
+            SasLog::Write("tick #%llu: loadout has no assigned skins yet", tick);
+        return;
+    }
 
-    // Resolve client.dll base — we are already inside the process
+    SasLog::Write("tick #%llu: loadout v%u — %zu weapon(s) assigned",
+        tick, loadoutVersion, skinMap.size());
+
+    // Resolve client.dll base — we are already inside the process.
     uintptr_t clientBase = reinterpret_cast<uintptr_t>(GetModuleHandleA("client.dll"));
-    SasLog::Write("tick #%llu: client.dll base = 0x%llx", tick, (unsigned long long)clientBase);
     if (!clientBase) {
         SasLog::Write("tick #%llu: client.dll not found — aborting", tick);
         return;
     }
 
-    // Read the global pointer to the local player controller
+    // Read the global pointer to the local player controller.
     uintptr_t localControllerPtr = MemRead<uintptr_t>(
         clientBase + offsets::dwLocalPlayerController);
-    SasLog::Write("tick #%llu: localControllerPtr = 0x%llx  (offset 0x%llx)",
-        tick, (unsigned long long)localControllerPtr,
-        (unsigned long long)offsets::dwLocalPlayerController);
     if (!localControllerPtr) {
-        SasLog::Write("tick #%llu: localControllerPtr is null — not in-game yet?", tick);
+        if (tick % 20 == 1)
+            SasLog::Write("tick #%llu: localControllerPtr is null — not in-game yet?", tick);
         return;
     }
 
     // Get the InventoryServices sub-object.
-    // NOTE: m_pInGameMoneyServices is used as a placeholder for the inventory
-    // services field. Verify this field name against the current client_dll.hpp
-    // if the pointer below resolves to a nonsense address and the game crashes.
+    // Field: CCSPlayerController::m_pInventoryServices (offset 0x810)
+    // This is the loadout/inventory pointer, NOT m_pInGameMoneyServices (0x808).
     uintptr_t inventoryServicesPtr = MemRead<uintptr_t>(
         localControllerPtr +
-        schemas::CCSPlayerController::m_pInGameMoneyServices);
-    SasLog::Write("tick #%llu: inventoryServicesPtr = 0x%llx  (field offset 0x%llx)",
-        tick, (unsigned long long)inventoryServicesPtr,
-        (unsigned long long)schemas::CCSPlayerController::m_pInGameMoneyServices);
+        schemas::CCSPlayerController::m_pInventoryServices);
     if (!inventoryServicesPtr) {
-        SasLog::Write("tick #%llu: inventoryServicesPtr is null — wrong field name?", tick);
+        SasLog::Write("tick #%llu: inventoryServicesPtr is null — wrong offset? verify client_dll.hpp", tick);
         return;
     }
 
-    // Read entity list base
+    // Read entity list base.
     uintptr_t entityListBase = MemRead<uintptr_t>(
         clientBase + offsets::dwEntityList);
-    SasLog::Write("tick #%llu: entityListBase = 0x%llx  (offset 0x%llx)",
-        tick, (unsigned long long)entityListBase,
-        (unsigned long long)offsets::dwEntityList);
     if (!entityListBase) {
         SasLog::Write("tick #%llu: entityListBase is null — aborting", tick);
         return;
@@ -181,9 +188,6 @@ static void ApplySkins()
     uintptr_t loadoutArray = inventoryServicesPtr +
         schemas::CCSPlayerController_InventoryServices::m_vecNetworkableLoadout;
 
-    SasLog::Write("tick #%llu: loadoutArray = 0x%llx, walking %d slots...",
-        tick, (unsigned long long)loadoutArray, LOADOUT_SLOTS);
-
     int written = 0;
     for (int i = 0; i < LOADOUT_SLOTS; ++i) {
         uint32_t handle = MemRead<uint32_t>(loadoutArray + i * sizeof(uint32_t));
@@ -192,18 +196,24 @@ static void ApplySkins()
         uintptr_t weaponEntity = EntityFromHandle(entityListBase, handle);
         if (!weaponEntity) continue;
 
+        // Read the weapon's actual defIndex from its EconItemView — do NOT write it.
+        // Writing it would corrupt the entity (bug #3 fix).
         uintptr_t attrMgrBase = weaponEntity + schemas::C_EconEntity::m_AttributeManager;
         uintptr_t itemViewPtr = attrMgrBase + schemas::C_AttributeContainer::m_Item;
+        int defIndex = static_cast<int>(
+            MemRead<uint16_t>(itemViewPtr + schemas::C_EconItemView::m_iItemDefinitionIndex));
 
-        MemWrite<uint16_t>(
-            itemViewPtr + schemas::C_EconItemView::m_iItemDefinitionIndex,
-            static_cast<uint16_t>(desiredDefIndex));
-        MemWrite<int32_t>(weaponEntity + schemas::C_EconEntity::m_nFallbackPaintKit, paintKitId);
-        MemWrite<float>  (weaponEntity + schemas::C_EconEntity::m_flFallbackWear,    wear);
+        auto it = skinMap.find(defIndex);
+        if (it == skinMap.end()) continue; // no skin assigned for this weapon
+
+        const LoadoutSlot& slot = it->second;
+        MemWrite<int32_t>(weaponEntity + schemas::C_EconEntity::m_nFallbackPaintKit, slot.paintKitId);
+        MemWrite<float>  (weaponEntity + schemas::C_EconEntity::m_flFallbackWear,    slot.wear);
         ++written;
     }
 
-    SasLog::Write("tick #%llu: done — wrote to %d weapon slot(s)", tick, written);
+    if (written > 0 || tick % 20 == 1)
+        SasLog::Write("tick #%llu: wrote to %d weapon slot(s)", tick, written);
 }
 
 static void UpdateLoop()

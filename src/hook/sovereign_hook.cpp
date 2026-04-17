@@ -102,60 +102,46 @@ std::atomic<bool>     g_running{false};
 std::thread           g_updateThread;
 std::atomic<uint64_t> g_tickCount{0};
 
-// Per-entity last-written state used to suppress redundant readback logs.
-// Key = weapon entity address.  We only log when the pre-write value diverges
-// from what we wrote last time (meaning the server/prediction wiped it).
-struct WrittenState {
-    int32_t  pk;
-    float    wear;
-    uint32_t idHigh;
-    uint64_t itemID;
-    bool     attribInit;
-    bool     visualsSet;
+// Per-entity state tracking.
+// Key = weapon entity address.
+// pduVersion = loadout version at which PostDataUpdate was last called.
+// We call PostDataUpdate once per entity per loadout version so the engine's
+// re-initialization path fires, then only re-call if the loadout changes.
+struct EntityState {
+    int32_t  lastPK;
+    float    lastWear;
+    uint32_t pduVersion;  // loadout version when PostDataUpdate last fired
 };
-std::unordered_map<uintptr_t, WrittenState> g_lastWritten;
+std::unordered_map<uintptr_t, EntityState> g_entityState;
 uint32_t g_lastLoadoutVersion = 0;
 
-// Per-entity heap buffers for injected CEconItemAttribute entries.
-// We allocate two entries per weapon (paint kit + wear), point the
-// m_NetworkedDynamicAttributes vector at them, and re-assert the pointer
-// every tick in case the server clears it.
-// Layout confirmed from live hex dump:
-//   m_Size    at attrVecBase + 0x00 (int32)
-//   m_pMemory at attrVecBase + 0x08 (T*)
-//   back-ptr  at attrVecBase + 0x18 — DO NOT TOUCH (engine-managed)
-//
-// CEconItemAttribute element layout (stride = 0x48 = 72 bytes):
-//   0x00-0x2F  embedded-network-var preamble (zeroed — safe for injected entries)
-//   0x30       m_iAttributeDefinitionIndex (uint16)
-//   0x34       m_flValue (float32 — integers stored as bit-cast uint32)
-static constexpr int kAttrEntries    = 2;     // paint kit + wear
-static constexpr int kAttrStride     = 0x48;  // sizeof(CEconItemAttribute) w/ alignment
-static constexpr uint16_t kAttrPaintKit = 6;  // CS2 attribute def index: paint kit
-static constexpr uint16_t kAttrWear     = 8;  // CS2 attribute def index: wear
-struct AttrBuf { uint8_t data[kAttrEntries * kAttrStride]; };
-std::unordered_map<uintptr_t, AttrBuf*> g_attrBufs;
+// PostDataUpdate vtable index in CEntityInstance (hl2sdk-cs2 layout, MSVC ABI).
+// CEntityInstance vtable:
+//   [0] unk001  [1] unk002  [2] GetScriptDesc  [3] ~dtor
+//   [4] Connect [5] Disconnect [6] Precache [7] AddedToEntityDatabase
+//   [8] Spawn   [9] unk101   [10] PostDataUpdate  ← index we call
+// DATA_UPDATE_DATATABLE_CHANGED = 1  (fields changed, rebuild from current state)
+static constexpr int   kPDU_VtableIdx = 10;
+static constexpr int   kDATA_UPDATE_DATATABLE_CHANGED = 1;
+typedef void (*PostDataUpdate_t)(void*, int);
 
 // ---------------------------------------------------------------------------
-// ApplySkins — reads the full per-weapon loadout from shared memory (written by
-// MuseumCurator.exe), then walks the local player's weapon loadout and writes:
+// ApplySkins — reads the full per-weapon loadout from shared memory, walks the
+// local player's weapon list, and for each matching weapon:
 //
-//   C_EconEntity::m_nFallbackPaintKit  — paint kit ID (Dragon Lore = 344…)
-//   C_EconEntity::m_flFallbackWear     — wear float [0.0, 1.0]
+//   1. Writes the fallback paint kit / wear / ItemID fields.
+//   2. Calls PostDataUpdate(DATA_UPDATE_DATATABLE_CHANGED) on the weapon entity
+//      via its vtable.  This is the same call the engine makes when a network
+//      packet arrives; it triggers the entity's re-initialization path which
+//      reads the fallback fields and rebuilds the weapon's visual state.
 //
-// The fallback fields exist precisely for this use-case; no attribute array
-// traversal required. We do NOT write m_iItemDefinitionIndex — the game engine
-// already has the correct type from its own state, and overwriting it corrupts
-// the entity.
+// PostDataUpdate must fire AFTER the field writes.  Without it, the engine never
+// re-evaluates the entity's skin even though the memory values are correct.
 //
-// Navigation chain (offsets from cs2-dumper client_dll.hpp):
-//   client.dll base + dwLocalPlayerController → CCSPlayerController*
-//     → m_pInventoryServices → CCSPlayerController_InventoryServices*
-//       → m_vecNetworkableLoadout[64] → entity handles
-//         → weapon entity
-//           → m_AttributeManager → C_AttributeContainer → m_Item → C_EconItemView
-//               (read m_iItemDefinitionIndex to identify weapon type)
-//           → m_nFallbackPaintKit, m_flFallbackWear  (write these)
+// We call PostDataUpdate once per entity per loadout version (tracked in
+// g_entityState) and reassert the field writes every tick to survive server
+// resets.  If the loadout version changes (user picks a new skin), we call it
+// again so the new paint kit is picked up.
 // ---------------------------------------------------------------------------
 static void ApplySkins()
 {
@@ -281,129 +267,92 @@ static void ApplySkins()
         int defIndex = static_cast<int>(
             MemRead<uint16_t>(itemViewPtr + schemas::C_EconItemView::m_iItemDefinitionIndex));
 
-        // Verbose per-slot logging only on tick 1 — helps diagnose entity walk
-        // correctness without flooding the log at 64 Hz.
+        // Verbose per-slot logging only on tick 1.
         if (tick == 1) {
             SasLog::Write("tick #%llu: slot[%d] handle=0x%08X entity=0x%llX defIndex=%d",
                 tick, i, handle, (unsigned long long)weaponEntity, defIndex);
         }
 
         auto it = skinMap.find(defIndex);
-        if (it == skinMap.end()) continue; // no skin assigned for this weapon
+        if (it == skinMap.end()) continue;
 
         const LoadoutSlot& slot = it->second;
 
-        // Pre-write readback: read current values BEFORE overwriting them.
-        // Pre-write readback diagnostic.  Compare current memory state against
-        // what we wrote last time for this entity.
-        //
-        // Only log when values diverge (means server/prediction wiped them).
-        // Silence = writes persist in memory.
-        // "OVERWRITTEN" = networking/prediction is wiping our values.
-        //
-        // m_iItemID (0x1C8) is the non-networked uint64 cache the renderer reads for
-        // "is this a valid GC item?" — this is DISTINCT from the networked m_iItemIDHigh
-        // (0x1D0) / m_iItemIDLow (0x1D4).  We must write both: the networked fields so
-        // that if the engine re-syncs the cache from High+Low it still sees 0xFFFF…,
-        // and the cache field itself so the renderer immediately sees an invalid ID.
-        uint64_t preItemID     = MemRead<uint64_t>(itemViewPtr  + schemas::C_EconItemView::m_iItemID);
-        uint32_t preIDHigh     = MemRead<uint32_t>(itemViewPtr  + schemas::C_EconItemView::m_iItemIDHigh);
-        int32_t  prePK         = MemRead<int32_t> (weaponEntity + schemas::C_EconEntity::m_nFallbackPaintKit);
-        float    preWear       = MemRead<float>   (weaponEntity + schemas::C_EconEntity::m_flFallbackWear);
-        bool     preAttribInit = MemRead<bool>    (weaponEntity + schemas::C_EconEntity::m_bAttributesInitialized);
-        bool     preVisualsSet = MemRead<bool>    (weaponEntity + schemas::C_CSWeaponBase::m_bVisualsDataSet);
+        // Read current state for change detection.
+        int32_t curPK       = MemRead<int32_t>(weaponEntity + schemas::C_EconEntity::m_nFallbackPaintKit);
+        float   curWear     = MemRead<float>  (weaponEntity + schemas::C_EconEntity::m_flFallbackWear);
+        bool    curVisuals  = MemRead<bool>   (weaponEntity + schemas::C_CSWeaponBase::m_bVisualsDataSet);
 
-        auto lastIt = g_lastWritten.find(weaponEntity);
-        if (lastIt == g_lastWritten.end()) {
-            // First time seeing this entity — log initial state.
-            SasLog::Write("tick #%llu: entity=0x%llX defIdx=%d first write; "
-                          "initial ItemID=0x%llX IDHigh=0x%08X pk=%d wear=%.4f "
-                          "attribInit=%d visualsSet=%d",
+        auto& es = g_entityState[weaponEntity];
+
+        bool firstSeen     = (es.pduVersion == 0);
+        bool loadoutChange = (loadoutVersion != es.pduVersion);
+        bool fieldReset    = (curPK != slot.paintKitId || curWear != slot.wear);
+
+        if (firstSeen) {
+            SasLog::Write("tick #%llu: entity=0x%llX defIdx=%d pk=%d wear=%.4f visualsSet=%d — first write",
                 tick, (unsigned long long)weaponEntity, defIndex,
-                (unsigned long long)preItemID, preIDHigh, prePK, preWear,
-                (int)preAttribInit, (int)preVisualsSet);
-        } else {
-            // Log any field the engine reset since our last write.
-            bool dirty = preItemID     != lastIt->second.itemID    ||
-                         preIDHigh     != lastIt->second.idHigh    ||
-                         prePK         != lastIt->second.pk        ||
-                         preWear       != lastIt->second.wear;
-            // Flag readback: if engine processed attribInit/visualsSet it sets them
-            // BACK to true between our ticks — log those transitions separately.
-            bool attribBack  = lastIt->second.attribInit == false && preAttribInit == true;
-            bool visualsBack = lastIt->second.visualsSet == false && preVisualsSet == true;
-            if (dirty) {
-                SasLog::Write("tick #%llu: entity=0x%llX defIdx=%d OVERWRITTEN — "
-                              "ItemID=0x%llX IDHigh=0x%08X pk=%d wear=%.4f",
-                    tick, (unsigned long long)weaponEntity, defIndex,
-                    (unsigned long long)preItemID, preIDHigh, prePK, preWear);
-            }
-            if (attribBack)
-                SasLog::Write("tick #%llu: entity=0x%llX defIdx=%d attribInit restored to true — engine processed",
-                    tick, (unsigned long long)weaponEntity, defIndex);
-            if (visualsBack)
-                SasLog::Write("tick #%llu: entity=0x%llX defIdx=%d visualsSet restored to true — engine processed",
-                    tick, (unsigned long long)weaponEntity, defIndex);
+                curPK, curWear, (int)curVisuals);
+        } else if (fieldReset) {
+            SasLog::Write("tick #%llu: entity=0x%llX defIdx=%d OVERWRITTEN (pk=%d wear=%.4f)",
+                tick, (unsigned long long)weaponEntity, defIndex, curPK, curWear);
         }
 
-        // ---------- Inject paint kit via m_NetworkedDynamicAttributes ----------
-        // The attribute lists are empty for bare (no-skin) weapons.  We allocate
-        // two CEconItemAttribute entries (paint kit + wear) and point the vector
-        // at them.  The preamble (bytes 0x00-0x2F of each entry) is zeroed — the
-        // engine reads def index and value but the preamble is only used for
-        // network-change notifications we don't need.
-        {
-            uintptr_t dynBase   = itemViewPtr + schemas::C_EconItemView::m_NetworkedDynamicAttributes;
-            uintptr_t dynVec    = dynBase + schemas::CAttributeList::m_Attributes;
+        // ---- Write skin fields ----
+        //
+        // m_iItemIDHigh = 1 marks this as a "foreign" item (non-zero, not a real
+        // GC item) so the engine uses the fallback fields instead of looking up
+        // attributes from the item cache.  We avoid 0xFFFFFFFF which some code
+        // paths treat as "explicitly invalid / skip".
+        //
+        // m_bAttributesInitialized is left TRUE (its natural state for bare
+        // weapons).  The engine's visual-rebuild condition is:
+        //   attribInit==true AND visualsSet==false AND ItemID!=0
+        // Clearing attribInit breaks the condition; we must not touch it.
+        //
+        // m_bVisualsDataSet stays FALSE (already false for bare weapons) to
+        // signal the engine that visuals need (re)building.
+        MemWrite<uint32_t>(itemViewPtr + schemas::C_EconItemView::m_iItemIDHigh, 1u);
+        MemWrite<uint32_t>(itemViewPtr + schemas::C_EconItemView::m_iItemIDLow,  0u);
+        MemWrite<uint64_t>(itemViewPtr + schemas::C_EconItemView::m_iItemID,     0x0000000100000000ULL);
+        MemWrite<bool>    (itemViewPtr + schemas::C_EconItemView::m_bInitialized, true);
+        MemWrite<int32_t> (weaponEntity + schemas::C_EconEntity::m_nFallbackPaintKit, slot.paintKitId);
+        MemWrite<float>   (weaponEntity + schemas::C_EconEntity::m_flFallbackWear,    slot.wear);
+        // Keep m_bVisualsDataSet false (already false; don't write true here).
 
-            AttrBuf* buf = nullptr;
-            auto abIt = g_attrBufs.find(weaponEntity);
-            if (abIt == g_attrBufs.end()) {
-                buf = new AttrBuf{};              // zero-initialised
-                g_attrBufs[weaponEntity] = buf;
+        es.lastPK   = slot.paintKitId;
+        es.lastWear = slot.wear;
 
-                // Entry 0: paint kit (def index 6), value = int bit-cast to float
-                *reinterpret_cast<uint16_t*>(buf->data + 0 * kAttrStride + 0x30) = kAttrPaintKit;
-                *reinterpret_cast<uint32_t*>(buf->data + 0 * kAttrStride + 0x34) = (uint32_t)slot.paintKitId;
-
-                // Entry 1: wear (def index 8), value = float
-                *reinterpret_cast<uint16_t*>(buf->data + 1 * kAttrStride + 0x30) = kAttrWear;
-                *reinterpret_cast<float*>   (buf->data + 1 * kAttrStride + 0x34) = slot.wear;
-
-                SasLog::Write("tick #%llu: entity=0x%llX defIdx=%d injected attrs pk=%d wear=%.4f at 0x%llX",
-                    tick, (unsigned long long)weaponEntity, defIndex,
-                    slot.paintKitId, slot.wear, (unsigned long long)buf);
-            } else {
-                buf = abIt->second;
-                // Update values if the loadout changed
-                *reinterpret_cast<uint32_t*>(buf->data + 0 * kAttrStride + 0x34) = (uint32_t)slot.paintKitId;
-                *reinterpret_cast<float*>   (buf->data + 1 * kAttrStride + 0x34) = slot.wear;
+        // ---- Call PostDataUpdate to trigger engine re-initialization ----
+        //
+        // Direct memory writes don't notify the engine that entity state changed.
+        // PostDataUpdate(DATA_UPDATE_DATATABLE_CHANGED) is what the engine calls
+        // when a network packet updates entity fields; it triggers the attribute
+        // manager to re-read item data, look up the fallback paint kit, and
+        // rebuild the weapon's visual state (setting m_bVisualsDataSet = true).
+        //
+        // We call it once per entity per loadout version so the engine runs the
+        // full init path with our written values.
+        if (loadoutChange) {
+            uintptr_t vtablePtr = MemRead<uintptr_t>(weaponEntity);
+            if (vtablePtr) {
+                uintptr_t fnAddr = MemRead<uintptr_t>(vtablePtr + kPDU_VtableIdx * sizeof(uintptr_t));
+                if (fnAddr) {
+                    auto fn = reinterpret_cast<PostDataUpdate_t>(fnAddr);
+                    fn(reinterpret_cast<void*>(weaponEntity), kDATA_UPDATE_DATATABLE_CHANGED);
+                    SasLog::Write("tick #%llu: entity=0x%llX defIdx=%d PostDataUpdate fired "
+                                  "(vtable[%d]=0x%llX) pk=%d wear=%.4f",
+                        tick, (unsigned long long)weaponEntity, defIndex,
+                        kPDU_VtableIdx, (unsigned long long)fnAddr,
+                        slot.paintKitId, slot.wear);
+                } else {
+                    SasLog::Write("tick #%llu: entity=0x%llX defIdx=%d vtable[%d] is null — skipping PDU",
+                        tick, (unsigned long long)weaponEntity, defIndex, kPDU_VtableIdx);
+                }
             }
-
-            // Re-assert the vector pointer every tick — server may clear m_Size/m_pMemory.
-            MemWrite<int32_t>  (dynVec + 0x00, kAttrEntries);
-            MemWrite<uintptr_t>(dynVec + 0x08, reinterpret_cast<uintptr_t>(buf->data));
+            es.pduVersion = loadoutVersion;
         }
 
-        // Invalidate the non-networked item ID cache (what the renderer actually reads).
-        MemWrite<uint64_t>(itemViewPtr + schemas::C_EconItemView::m_iItemID,     0xFFFFFFFFFFFFFFFFull);
-        // Also cover the networked split fields so a re-sync from High+Low still sees invalid.
-        MemWrite<uint64_t>(itemViewPtr + schemas::C_EconItemView::m_iItemIDHigh, 0xFFFFFFFFFFFFFFFFull);
-        MemWrite<int32_t>(weaponEntity + schemas::C_EconEntity::m_nFallbackPaintKit, slot.paintKitId);
-        MemWrite<float>  (weaponEntity + schemas::C_EconEntity::m_flFallbackWear,    slot.wear);
-
-        // Clear m_bAttributesInitialized so CS2 re-parses the item view attributes.
-        // When this flag is false the attribute manager re-reads the item definition;
-        // with an invalid item ID it should fall through to the fallback paint kit.
-        MemWrite<bool>(weaponEntity + schemas::C_EconEntity::m_bAttributesInitialized, false);
-
-        // Clear m_bVisualsDataSet so the weapon re-applies its paint material.
-        MemWrite<bool>(weaponEntity + schemas::C_CSWeaponBase::m_bVisualsDataSet, false);
-
-        g_lastWritten[weaponEntity] = {
-            slot.paintKitId, slot.wear, 0xFFFFFFFFu, 0xFFFFFFFFFFFFFFFFull,
-            /*attribInit=*/false, /*visualsSet=*/false
-        };
         ++written;
     }
 

@@ -110,11 +110,31 @@ struct WrittenState {
     float    wear;
     uint32_t idHigh;
     uint64_t itemID;
-    bool     attribInit;   // m_bAttributesInitialized — true = engine re-processed us
-    bool     visualsSet;   // m_bVisualsDataSet        — true = engine re-processed us
+    bool     attribInit;
+    bool     visualsSet;
 };
 std::unordered_map<uintptr_t, WrittenState> g_lastWritten;
 uint32_t g_lastLoadoutVersion = 0;
+
+// Per-entity heap buffers for injected CEconItemAttribute entries.
+// We allocate two entries per weapon (paint kit + wear), point the
+// m_NetworkedDynamicAttributes vector at them, and re-assert the pointer
+// every tick in case the server clears it.
+// Layout confirmed from live hex dump:
+//   m_Size    at attrVecBase + 0x00 (int32)
+//   m_pMemory at attrVecBase + 0x08 (T*)
+//   back-ptr  at attrVecBase + 0x18 — DO NOT TOUCH (engine-managed)
+//
+// CEconItemAttribute element layout (stride = 0x48 = 72 bytes):
+//   0x00-0x2F  embedded-network-var preamble (zeroed — safe for injected entries)
+//   0x30       m_iAttributeDefinitionIndex (uint16)
+//   0x34       m_flValue (float32 — integers stored as bit-cast uint32)
+static constexpr int kAttrEntries    = 2;     // paint kit + wear
+static constexpr int kAttrStride     = 0x48;  // sizeof(CEconItemAttribute) w/ alignment
+static constexpr uint16_t kAttrPaintKit = 6;  // CS2 attribute def index: paint kit
+static constexpr uint16_t kAttrWear     = 8;  // CS2 attribute def index: wear
+struct AttrBuf { uint8_t data[kAttrEntries * kAttrStride]; };
+std::unordered_map<uintptr_t, AttrBuf*> g_attrBufs;
 
 // ---------------------------------------------------------------------------
 // ApplySkins — reads the full per-weapon loadout from shared memory (written by
@@ -326,41 +346,43 @@ static void ApplySkins()
                     tick, (unsigned long long)weaponEntity, defIndex);
         }
 
-        // ---------- Attribute list memory layout dump (first write only) ----------
-        // Both CAttributeList fields (m_AttributeList at 0x208 and
-        // m_NetworkedDynamicAttributes at 0x280 in C_EconItemView) are examined.
-        // We dump 40 bytes raw from the m_Attributes vector inside each one so we
-        // can figure out the C_UtlVectorEmbeddedNetworkVar layout and element stride
-        // before writing to it.
-        if (lastIt == g_lastWritten.end()) {
-            // m_AttributeList (non-networked in name, but is NetworkVarName — may be more stable)
-            {
-                uintptr_t base = itemViewPtr + schemas::C_EconItemView::m_AttributeList;
-                uintptr_t vec  = base + schemas::CAttributeList::m_Attributes;
-                uint64_t w0 = MemRead<uint64_t>(vec + 0x00);
-                uint64_t w1 = MemRead<uint64_t>(vec + 0x08);
-                uint64_t w2 = MemRead<uint64_t>(vec + 0x10);
-                uint64_t w3 = MemRead<uint64_t>(vec + 0x18);
-                uint64_t w4 = MemRead<uint64_t>(vec + 0x20);
-                SasLog::Write("tick #%llu: entity=0x%llX defIdx=%d "
-                              "m_AttributeList vec[0..4]: %016llX %016llX %016llX %016llX %016llX",
+        // ---------- Inject paint kit via m_NetworkedDynamicAttributes ----------
+        // The attribute lists are empty for bare (no-skin) weapons.  We allocate
+        // two CEconItemAttribute entries (paint kit + wear) and point the vector
+        // at them.  The preamble (bytes 0x00-0x2F of each entry) is zeroed — the
+        // engine reads def index and value but the preamble is only used for
+        // network-change notifications we don't need.
+        {
+            uintptr_t dynBase   = itemViewPtr + schemas::C_EconItemView::m_NetworkedDynamicAttributes;
+            uintptr_t dynVec    = dynBase + schemas::CAttributeList::m_Attributes;
+
+            AttrBuf* buf = nullptr;
+            auto abIt = g_attrBufs.find(weaponEntity);
+            if (abIt == g_attrBufs.end()) {
+                buf = new AttrBuf{};              // zero-initialised
+                g_attrBufs[weaponEntity] = buf;
+
+                // Entry 0: paint kit (def index 6), value = int bit-cast to float
+                *reinterpret_cast<uint16_t*>(buf->data + 0 * kAttrStride + 0x30) = kAttrPaintKit;
+                *reinterpret_cast<uint32_t*>(buf->data + 0 * kAttrStride + 0x34) = (uint32_t)slot.paintKitId;
+
+                // Entry 1: wear (def index 8), value = float
+                *reinterpret_cast<uint16_t*>(buf->data + 1 * kAttrStride + 0x30) = kAttrWear;
+                *reinterpret_cast<float*>   (buf->data + 1 * kAttrStride + 0x34) = slot.wear;
+
+                SasLog::Write("tick #%llu: entity=0x%llX defIdx=%d injected attrs pk=%d wear=%.4f at 0x%llX",
                     tick, (unsigned long long)weaponEntity, defIndex,
-                    w0, w1, w2, w3, w4);
+                    slot.paintKitId, slot.wear, (unsigned long long)buf);
+            } else {
+                buf = abIt->second;
+                // Update values if the loadout changed
+                *reinterpret_cast<uint32_t*>(buf->data + 0 * kAttrStride + 0x34) = (uint32_t)slot.paintKitId;
+                *reinterpret_cast<float*>   (buf->data + 1 * kAttrStride + 0x34) = slot.wear;
             }
-            // m_NetworkedDynamicAttributes
-            {
-                uintptr_t base = itemViewPtr + schemas::C_EconItemView::m_NetworkedDynamicAttributes;
-                uintptr_t vec  = base + schemas::CAttributeList::m_Attributes;
-                uint64_t w0 = MemRead<uint64_t>(vec + 0x00);
-                uint64_t w1 = MemRead<uint64_t>(vec + 0x08);
-                uint64_t w2 = MemRead<uint64_t>(vec + 0x10);
-                uint64_t w3 = MemRead<uint64_t>(vec + 0x18);
-                uint64_t w4 = MemRead<uint64_t>(vec + 0x20);
-                SasLog::Write("tick #%llu: entity=0x%llX defIdx=%d "
-                              "m_NetworkedDynAttr vec[0..4]: %016llX %016llX %016llX %016llX %016llX",
-                    tick, (unsigned long long)weaponEntity, defIndex,
-                    w0, w1, w2, w3, w4);
-            }
+
+            // Re-assert the vector pointer every tick — server may clear m_Size/m_pMemory.
+            MemWrite<int32_t>  (dynVec + 0x00, kAttrEntries);
+            MemWrite<uintptr_t>(dynVec + 0x08, reinterpret_cast<uintptr_t>(buf->data));
         }
 
         // Invalidate the non-networked item ID cache (what the renderer actually reads).

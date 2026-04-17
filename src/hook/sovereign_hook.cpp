@@ -171,6 +171,7 @@ static void ApplySkins()
         SasLog::Write("tick #%llu: client.dll not found — aborting", tick);
         return;
     }
+    SasLog::Write("tick #%llu: clientBase=0x%llX", tick, (unsigned long long)clientBase);
 
     // Read the global pointer to the local player controller.
     uintptr_t localControllerPtr = MemRead<uintptr_t>(
@@ -180,6 +181,7 @@ static void ApplySkins()
             SasLog::Write("tick #%llu: localControllerPtr is null — not in-game yet?", tick);
         return;
     }
+    SasLog::Write("tick #%llu: localControllerPtr=0x%llX", tick, (unsigned long long)localControllerPtr);
 
     // Read entity list base.
     uintptr_t entityListBase = MemRead<uintptr_t>(
@@ -188,6 +190,7 @@ static void ApplySkins()
         SasLog::Write("tick #%llu: entityListBase is null — aborting", tick);
         return;
     }
+    SasLog::Write("tick #%llu: entityListBase=0x%llX", tick, (unsigned long long)entityListBase);
 
     // Resolve the local player pawn from the controller.
     // m_hPlayerPawn is a CHandle (uint32) — must be resolved via EntityFromHandle.
@@ -198,23 +201,23 @@ static void ApplySkins()
             SasLog::Write("tick #%llu: pawn handle invalid (0x%08X) — not spawned yet", tick, pawnHandle);
         return;
     }
+    SasLog::Write("tick #%llu: pawnHandle=0x%08X", tick, pawnHandle);
+
     uintptr_t pawnEntity = EntityFromHandle(entityListBase, pawnHandle);
     if (!pawnEntity) {
-        // Handle was non-trivial but entity resolved to null — log every tick so we notice.
         SasLog::Write("tick #%llu: pawn handle 0x%08X resolved to null entity — stale list?", tick, pawnHandle);
         return;
     }
+    SasLog::Write("tick #%llu: pawnEntity=0x%llX", tick, (unsigned long long)pawnEntity);
 
     // Get weapon services from the pawn (team-agnostic; contains all carried weapons).
-    // Previously used m_vecNetworkableLoadout on InventoryServices, which is a CUtlVector
-    // of NetworkedLoadoutSlot_t structs — not entity handles — and is split by team slot
-    // index, causing T-side weapons to be missed entirely.
     uintptr_t weaponServicesPtr = MemRead<uintptr_t>(
         pawnEntity + schemas::C_BasePlayerPawn::m_pWeaponServices);
     if (!weaponServicesPtr) {
         SasLog::Write("tick #%llu: weaponServicesPtr is null", tick);
         return;
     }
+    SasLog::Write("tick #%llu: weaponServicesPtr=0x%llX", tick, (unsigned long long)weaponServicesPtr);
 
     // m_hMyWeapons is C_NetworkUtlVectorBase<CHandle<C_BasePlayerWeapon>> (24 bytes):
     //   +0x00  T*      data pointer
@@ -230,6 +233,7 @@ static void ApplySkins()
             SasLog::Write("tick #%llu: weapon list empty or invalid (count=%d)", tick, weaponsCount);
         return;
     }
+    SasLog::Write("tick #%llu: weaponsDataPtr=0x%llX count=%d", tick, (unsigned long long)weaponsDataPtr, weaponsCount);
 
     int written = 0;
     for (int i = 0; i < weaponsCount; ++i) {
@@ -237,14 +241,19 @@ static void ApplySkins()
         if (handle == 0 || handle == 0xFFFFFFFF) continue;
 
         uintptr_t weaponEntity = EntityFromHandle(entityListBase, handle);
+        SasLog::Write("tick #%llu: slot[%d] handle=0x%08X entity=0x%llX",
+            tick, i, handle, (unsigned long long)weaponEntity);
         if (!weaponEntity) continue;
 
         // Read the weapon's actual defIndex from its EconItemView — do NOT write it.
         // Writing it would corrupt the entity (bug #3 fix).
         uintptr_t attrMgrBase = weaponEntity + schemas::C_EconEntity::m_AttributeManager;
         uintptr_t itemViewPtr = attrMgrBase + schemas::C_AttributeContainer::m_Item;
+        SasLog::Write("tick #%llu: slot[%d] reading defIndex from 0x%llX",
+            tick, i, (unsigned long long)(itemViewPtr + schemas::C_EconItemView::m_iItemDefinitionIndex));
         int defIndex = static_cast<int>(
             MemRead<uint16_t>(itemViewPtr + schemas::C_EconItemView::m_iItemDefinitionIndex));
+        SasLog::Write("tick #%llu: slot[%d] defIndex=%d", tick, i, defIndex);
 
         auto it = skinMap.find(defIndex);
         if (it == skinMap.end()) continue; // no skin assigned for this weapon
